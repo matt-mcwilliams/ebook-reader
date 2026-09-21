@@ -14,6 +14,12 @@ gi.require_version("Gio", "2.0")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
+from .annotations import (
+    Annotation,
+    AnnotationStore,
+    marker_top_left,
+    pixels_to_normalized,
+)
 from .document import DocumentError, PdfDocument
 from .renderer import (
     DEFAULT_SCALE,
@@ -67,6 +73,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._settings = SettingsStore()
         if self._settings.prune_missing():
             self._save_settings()
+        self._annotations = AnnotationStore()
 
         self.set_title(APPLICATION_TITLE)
         self.set_default_size(1000, 750)
@@ -93,6 +100,17 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._reset_scroll_on_render = True
         self._file_dialog: Gtk.FileDialog | None = None
         self._closing = False
+        self._annotation_mode = False
+        self._page_width = 0
+        self._page_height = 0
+        self._annotation_marker_buttons: dict[str, Gtk.Button] = {}
+        self._annotation_marker_bounds: dict[str, tuple[float, float, float, float]] = {}
+        self._annotation_editor: Gtk.Popover | None = None
+        self._annotation_editor_annotation_id: str | None = None
+        self._annotation_note_view: Gtk.TextView | None = None
+        self._annotation_confirmation: Gtk.Popover | None = None
+        self._annotation_closing_editor = False
+        self._annotation_feedback_timeout_id: int | None = None
 
         self._title_label = Gtk.Label(label=APPLICATION_TITLE)
         self._title_label.set_max_width_chars(48)
@@ -141,6 +159,34 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 box-shadow: 0 3px 14px alpha(black, 0.20);
             }
             .reader-error {
+                color: @error_color;
+            }
+            .annotation-marker {
+                background: @error_color;
+                color: white;
+                border: 2px solid white;
+                border-radius: 9999px;
+                font-weight: 700;
+                padding: 0;
+            }
+            .annotation-marker:hover {
+                background: shade(@error_color, 0.82);
+            }
+            .annotation-marker:focus {
+                outline: 3px solid @theme_fg_color;
+                outline-offset: 2px;
+            }
+            .annotation-mode-button:checked {
+                background: alpha(@accent_bg_color, 0.35);
+            }
+            .annotation-prompt,
+            .annotation-feedback {
+                background: alpha(@theme_bg_color, 0.94);
+                border-radius: 8px;
+                padding: 8px 12px;
+                margin: 12px;
+            }
+            .annotation-feedback {
                 color: @error_color;
             }
             """
@@ -199,9 +245,19 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._page_picture.set_halign(Gtk.Align.CENTER)
         self._page_picture.set_valign(Gtk.Align.CENTER)
 
+        self._page_fixed = Gtk.Fixed()
+        self._page_fixed.set_halign(Gtk.Align.CENTER)
+        self._page_fixed.set_valign(Gtk.Align.CENTER)
+        self._page_fixed.set_can_target(True)
+        self._page_fixed.put(self._page_picture, 0, 0)
+        page_click = Gtk.GestureClick()
+        page_click.set_button(Gdk.BUTTON_PRIMARY)
+        page_click.connect("released", self._on_page_click_released)
+        self._page_fixed.add_controller(page_click)
+
         self._page_frame = Gtk.Frame()
         self._page_frame.add_css_class("reader-page")
-        self._page_frame.set_child(self._page_picture)
+        self._page_frame.set_child(self._page_fixed)
         self._page_frame.set_halign(Gtk.Align.CENTER)
         self._page_frame.set_valign(Gtk.Align.CENTER)
 
@@ -226,6 +282,22 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._render_spinner.set_margin_end(12)
         self._render_spinner.set_visible(False)
         self._page_overlay.add_overlay(self._render_spinner)
+
+        self._annotation_prompt = Gtk.Label()
+        self._annotation_prompt.add_css_class("annotation-prompt")
+        self._annotation_prompt.set_halign(Gtk.Align.CENTER)
+        self._annotation_prompt.set_valign(Gtk.Align.START)
+        self._annotation_prompt.set_visible(False)
+        self._annotation_prompt.set_can_target(False)
+        self._page_overlay.add_overlay(self._annotation_prompt)
+
+        self._annotation_feedback = Gtk.Label()
+        self._annotation_feedback.add_css_class("annotation-feedback")
+        self._annotation_feedback.set_halign(Gtk.Align.CENTER)
+        self._annotation_feedback.set_valign(Gtk.Align.END)
+        self._annotation_feedback.set_visible(False)
+        self._annotation_feedback.set_can_target(False)
+        self._page_overlay.add_overlay(self._annotation_feedback)
 
         reader = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         reader.set_hexpand(True)
@@ -295,6 +367,12 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._fit_button.set_tooltip_text("Fit the page to the window (Ctrl+0)")
         self._fit_button.connect("toggled", self._on_fit_toggled)
 
+        self._annotate_button = Gtk.ToggleButton(label="Annotate")
+        self._annotate_button.add_css_class("annotation-mode-button")
+        self._set_accessible_label(self._annotate_button, "Annotate (A)")
+        self._annotate_button.set_tooltip_text("Place an annotation (A)")
+        self._annotate_button.connect("toggled", self._on_annotate_toggled)
+
         for child in (
             self._previous_button,
             self._page_entry,
@@ -305,6 +383,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
             self._zoom_label,
             self._zoom_in_button,
             self._fit_button,
+            self._annotate_button,
         ):
             controls.append(child)
 
@@ -313,6 +392,379 @@ class ReaderWindow(Gtk.ApplicationWindow):
     @staticmethod
     def _set_accessible_label(widget: Gtk.Widget, label: str) -> None:
         widget.update_property([Gtk.AccessibleProperty.LABEL], [label])
+
+    def _on_annotate_toggled(self, button: Gtk.ToggleButton) -> None:
+        self._set_annotation_mode(button.get_active())
+
+    def _set_annotation_mode(self, active: bool) -> bool:
+        """Keep annotation mode's state, button, prompt, and cursor together."""
+
+        if active and self._document is None:
+            active = False
+        if active and self._annotation_editor is not None:
+            if not self._close_annotation_editor(save=True):
+                active = False
+
+        self._annotation_mode = active
+        if self._annotate_button.get_active() != active:
+            self._annotate_button.set_active(active)
+
+        if active:
+            self._update_annotation_prompt()
+            self._annotation_prompt.set_visible(True)
+            try:
+                self._page_fixed.set_cursor(Gdk.Cursor.new_from_name("crosshair", None))
+            except (TypeError, GLib.Error):  # pragma: no cover - GTK version dependent
+                self._page_fixed.set_cursor(None)
+        else:
+            self._annotation_prompt.set_visible(False)
+            self._page_fixed.set_cursor(None)
+        return active
+
+    def _update_annotation_prompt(self) -> None:
+        if self._document is None:
+            return
+        next_number = self._annotations.next_number(self._document.identity)
+        self._annotation_prompt.set_text(
+            f"Click the page to place annotation {next_number} · Esc to cancel"
+        )
+
+    def _on_page_click_released(
+        self,
+        gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+    ) -> None:
+        """Create an annotation only for a click inside the rendered page."""
+
+        if not self._annotation_mode or self._document is None:
+            return
+        if self._point_hits_marker(x, y):
+            return
+        if not 0 <= x <= self._page_width or not 0 <= y <= self._page_height:
+            return
+        try:
+            normalized_x, normalized_y = pixels_to_normalized(
+                x,
+                y,
+                self._page_width,
+                self._page_height,
+            )
+        except ValueError:
+            return
+        self._place_annotation(normalized_x, normalized_y)
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _place_annotation(self, x: float, y: float) -> None:
+        document = self._document
+        if document is None:
+            return
+        snapshot = self._annotations.get_document(document.identity)
+        try:
+            annotation = self._annotations.create(
+                document.identity,
+                page=self._current_page,
+                x=x,
+                y=y,
+            )
+            self._annotations.save()
+        except Exception as error:  # pragma: no cover - filesystem/UI boundary
+            self._annotations.restore_document(snapshot)
+            self._report_annotation_save_error("The annotation could not be saved", error)
+            return
+
+        self._set_annotation_mode(False)
+        self._refresh_annotation_markers()
+        self._open_annotation_editor(annotation)
+
+    def _refresh_annotation_markers(self) -> None:
+        """Rebuild visible markers from the current rendered page dimensions."""
+
+        if not hasattr(self, "_page_fixed"):
+            return
+        for button in tuple(self._annotation_marker_buttons.values()):
+            self._page_fixed.remove(button)
+        self._annotation_marker_buttons.clear()
+        self._annotation_marker_bounds.clear()
+
+        document = self._document
+        if document is None or self._page_width <= 0 or self._page_height <= 0:
+            return
+
+        for annotation in self._annotations.annotations_for(document.identity, self._current_page):
+            width, height = self._marker_dimensions(annotation.number)
+            left, top = marker_top_left(
+                annotation.x,
+                annotation.y,
+                self._page_width,
+                self._page_height,
+                width,
+                height,
+            )
+            button = Gtk.Button(label=str(annotation.number))
+            button.add_css_class("annotation-marker")
+            button.set_size_request(width, height)
+            button.set_focusable(True)
+            self._update_marker_metadata(button, annotation)
+            button.connect(
+                "clicked",
+                lambda _button, annotation_id=annotation.id: self._on_marker_clicked(annotation_id),
+            )
+            self._page_fixed.put(button, left, top)
+            self._annotation_marker_buttons[annotation.id] = button
+            self._annotation_marker_bounds[annotation.id] = (
+                left,
+                top,
+                float(width),
+                float(height),
+            )
+
+    @staticmethod
+    def _marker_dimensions(number: int) -> tuple[int, int]:
+        """Size markers for at least three digits without truncating larger ones."""
+
+        return max(38, 20 + len(str(number)) * 10), 38
+
+    def _update_marker_metadata(self, button: Gtk.Button, annotation: Annotation) -> None:
+        preview = self._annotation_preview(annotation.note)
+        if preview:
+            label = f"Annotation {annotation.number}: {preview}"
+            tooltip = label
+        else:
+            label = f"Annotation {annotation.number}, no notes"
+            tooltip = f"Annotation {annotation.number}"
+        self._set_accessible_label(button, label)
+        button.set_tooltip_text(tooltip)
+
+    @staticmethod
+    def _annotation_preview(note: str) -> str:
+        return " ".join(note.split())[:120]
+
+    def _point_hits_marker(self, x: float, y: float) -> bool:
+        return any(
+            left <= x <= left + width and top <= y <= top + height
+            for left, top, width, height in self._annotation_marker_bounds.values()
+        )
+
+    def _on_marker_clicked(self, annotation_id: str) -> None:
+        document = self._document
+        if document is None:
+            return
+        annotation = self._annotations.get(document.identity, annotation_id)
+        if annotation is not None:
+            self._open_annotation_editor(annotation)
+
+    def _open_annotation_editor(self, annotation: Annotation) -> None:
+        document = self._document
+        marker = self._annotation_marker_buttons.get(annotation.id)
+        if document is None or marker is None:
+            return
+        if self._annotation_editor is not None:
+            if self._annotation_editor_annotation_id == annotation.id:
+                if self._annotation_note_view is not None:
+                    self._annotation_note_view.grab_focus()
+                return
+            if not self._close_annotation_editor(save=True):
+                return
+        self._set_annotation_mode(False)
+
+        popover = Gtk.Popover()
+        popover.set_autohide(True)
+        popover.set_position(Gtk.PositionType.BOTTOM)
+        popover.connect("closed", self._on_annotation_popover_closed)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        heading = Gtk.Label(label=f"Annotation {annotation.number}")
+        heading.add_css_class("heading")
+        heading.set_halign(Gtk.Align.START)
+
+        note_view = Gtk.TextView()
+        note_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        note_view.set_vexpand(True)
+        note_view.set_size_request(280, 120)
+        note_view.set_hexpand(True)
+        self._set_accessible_label(note_view, f"Notes for annotation {annotation.number}")
+        note_view.get_buffer().set_text(annotation.note)
+        note_scroll = Gtk.ScrolledWindow()
+        note_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        note_scroll.set_child(note_view)
+        note_scroll.set_min_content_height(120)
+        note_scroll.set_min_content_width(280)
+
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        actions.set_halign(Gtk.Align.END)
+        done_button = Gtk.Button(label="Done")
+        self._set_accessible_label(done_button, "Done editing annotation")
+        done_button.add_css_class("suggested-action")
+        done_button.connect("clicked", self._on_annotation_done_clicked)
+        delete_button = Gtk.Button(label="Delete")
+        self._set_accessible_label(delete_button, f"Delete annotation {annotation.number}")
+        delete_button.connect("clicked", self._on_annotation_delete_clicked)
+        actions.append(delete_button)
+        actions.append(done_button)
+
+        content.append(heading)
+        content.append(note_scroll)
+        content.append(actions)
+        popover.set_child(content)
+        popover.set_parent(marker)
+        self._annotation_editor = popover
+        self._annotation_editor_annotation_id = annotation.id
+        self._annotation_note_view = note_view
+        popover.popup()
+        GLib.idle_add(self._focus_annotation_notes, popover)
+
+    def _focus_annotation_notes(self, popover: Gtk.Popover) -> bool:
+        if self._annotation_editor is popover and self._annotation_note_view is not None:
+            self._annotation_note_view.grab_focus()
+        return GLib.SOURCE_REMOVE
+
+    def _on_annotation_popover_closed(self, popover: Gtk.Popover) -> None:
+        if self._annotation_closing_editor or self._annotation_editor is not popover:
+            return
+        if self._save_annotation_note():
+            self._destroy_annotation_editor()
+        else:
+            popover.popup()
+            if self._annotation_note_view is not None:
+                self._annotation_note_view.grab_focus()
+
+    def _on_annotation_done_clicked(self, _button: Gtk.Button) -> None:
+        self._close_annotation_editor(save=True)
+
+    def _close_annotation_editor(self, *, save: bool) -> bool:
+        if self._annotation_editor is None:
+            return True
+        if save and not self._save_annotation_note():
+            return False
+        self._destroy_annotation_editor()
+        return True
+
+    def _save_annotation_note(self) -> bool:
+        document = self._document
+        annotation_id = self._annotation_editor_annotation_id
+        note_view = self._annotation_note_view
+        if document is None or annotation_id is None or note_view is None:
+            return True
+        start, end = note_view.get_buffer().get_bounds()
+        note = note_view.get_buffer().get_text(start, end, True)
+        snapshot = self._annotations.get_document(document.identity)
+        try:
+            updated = self._annotations.update(document.identity, annotation_id, note=note)
+            self._annotations.save()
+        except Exception as error:  # pragma: no cover - filesystem/UI boundary
+            self._annotations.restore_document(snapshot)
+            self._report_annotation_save_error("The annotation note could not be saved", error)
+            return False
+
+        marker = self._annotation_marker_buttons.get(annotation_id)
+        if marker is not None:
+            self._update_marker_metadata(marker, updated)
+        return True
+
+    def _destroy_annotation_editor(self) -> None:
+        popover = self._annotation_editor
+        if popover is None:
+            return
+        self._close_annotation_confirmation()
+        self._annotation_closing_editor = True
+        try:
+            popover.popdown()
+            popover.set_child(None)
+            if popover.get_parent() is not None:
+                popover.unparent()
+        finally:
+            self._annotation_closing_editor = False
+        self._annotation_editor = None
+        self._annotation_editor_annotation_id = None
+        self._annotation_note_view = None
+
+    def _on_annotation_delete_clicked(self, button: Gtk.Button) -> None:
+        if self._annotation_editor is None:
+            return
+        self._close_annotation_confirmation()
+        confirmation = Gtk.Popover()
+        confirmation.set_autohide(True)
+        confirmation.set_position(Gtk.PositionType.BOTTOM)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+        content.set_margin_top(12)
+        content.set_margin_bottom(12)
+        label = Gtk.Label(label="Delete this annotation permanently?")
+        label.set_wrap(True)
+        label.set_max_width_chars(32)
+        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        actions.set_halign(Gtk.Align.END)
+        cancel = Gtk.Button(label="Cancel")
+        self._set_accessible_label(cancel, "Cancel annotation deletion")
+        cancel.connect("clicked", lambda _button: self._close_annotation_confirmation())
+        confirm = Gtk.Button(label="Delete")
+        self._set_accessible_label(confirm, "Confirm annotation deletion")
+        confirm.add_css_class("destructive-action")
+        confirm.connect("clicked", self._on_annotation_delete_confirmed)
+        actions.append(cancel)
+        actions.append(confirm)
+        content.append(label)
+        content.append(actions)
+        confirmation.set_child(content)
+        confirmation.set_parent(button)
+        self._annotation_confirmation = confirmation
+        confirmation.popup()
+
+    def _on_annotation_delete_confirmed(self, _button: Gtk.Button) -> None:
+        document = self._document
+        annotation_id = self._annotation_editor_annotation_id
+        if document is None or annotation_id is None:
+            return
+        snapshot = self._annotations.get_document(document.identity)
+        try:
+            self._annotations.delete(document.identity, annotation_id)
+            self._annotations.save()
+        except Exception as error:  # pragma: no cover - filesystem/UI boundary
+            self._annotations.restore_document(snapshot)
+            self._close_annotation_confirmation()
+            self._report_annotation_save_error("The annotation could not be deleted", error)
+            return
+
+        self._close_annotation_confirmation()
+        self._destroy_annotation_editor()
+        self._refresh_annotation_markers()
+        self._update_annotation_prompt()
+
+    def _close_annotation_confirmation(self) -> None:
+        confirmation = self._annotation_confirmation
+        if confirmation is None:
+            return
+        confirmation.popdown()
+        confirmation.set_child(None)
+        if confirmation.get_parent() is not None:
+            confirmation.unparent()
+        self._annotation_confirmation = None
+
+    def _report_annotation_save_error(self, message: str, error: BaseException) -> None:
+        print(f"{message}: {error}", file=sys.stderr)
+        self._show_annotation_feedback(f"{message}. Try again.")
+
+    def _show_annotation_feedback(self, message: str) -> None:
+        if self._annotation_feedback_timeout_id is not None:
+            GLib.source_remove(self._annotation_feedback_timeout_id)
+        self._annotation_feedback.set_text(message)
+        self._annotation_feedback.set_visible(True)
+        self._annotation_feedback_timeout_id = GLib.timeout_add(
+            4500,
+            self._hide_annotation_feedback,
+        )
+
+    def _hide_annotation_feedback(self) -> bool:
+        self._annotation_feedback_timeout_id = None
+        self._annotation_feedback.set_visible(False)
+        return GLib.SOURCE_REMOVE
 
     def _install_input_controllers(self) -> None:
         """Install keyboard, wheel-zoom, and file-drop input handling."""
@@ -425,6 +877,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
     def open_file(self, file: Gio.File | str | Path) -> None:
         """Begin opening a local file from the chooser or GApplication."""
 
+        if not self._close_annotation_editor(save=True):
+            return
+        self._set_annotation_mode(False)
+
         if isinstance(file, Gio.File):
             path = file.get_path()
             if path is None:
@@ -441,6 +897,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
         generation = self._load_generation
         self._document = None
         self._current_page = 0
+        self._page_width = 0
+        self._page_height = 0
+        self._refresh_annotation_markers()
+        self._update_reader_controls()
         self._reset_scroll_on_render = True
         self._title_label.set_text(APPLICATION_TITLE)
         self.set_title(APPLICATION_TITLE)
@@ -499,7 +959,18 @@ class ReaderWindow(Gtk.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _show_error(self, message: str) -> None:
+        if not self._close_annotation_editor(save=True):
+            # Keep the editor and its unsaved text available for retry rather
+            # than replacing it with an error page that would lose the note.
+            self._set_annotation_mode(False)
+            self._show_annotation_feedback(message)
+            return
+        self._set_annotation_mode(False)
         self._document = None
+        self._page_width = 0
+        self._page_height = 0
+        self._refresh_annotation_markers()
+        self._update_reader_controls()
         self._render_generation += 1
         self._cancel_pending_render()
         self._render_cache.clear()
@@ -518,6 +989,8 @@ class ReaderWindow(Gtk.ApplicationWindow):
         """Move to a clamped zero-based page index and request a render."""
 
         if self._document is None:
+            return
+        if not self._close_annotation_editor(save=True):
             return
 
         clamped = max(0, min(index, self._document.page_count - 1))
@@ -557,6 +1030,8 @@ class ReaderWindow(Gtk.ApplicationWindow):
 
         if self._document is None:
             return
+        if not self._close_annotation_editor(save=True):
+            return
 
         if self._zoom_mode == "fit":
             self._manual_zoom = clamp_manual_scale(self._last_render_scale)
@@ -570,6 +1045,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
 
     def _on_fit_toggled(self, button: Gtk.ToggleButton) -> None:
         if self._document is None:
+            return
+        if not self._close_annotation_editor(save=True):
+            if button.get_active() != (self._zoom_mode == "fit"):
+                button.set_active(self._zoom_mode == "fit")
             return
 
         if button.get_active():
@@ -738,6 +1217,11 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._last_render_scale = scale
         self._page_picture.set_paintable(rendered.texture)
         self._page_picture.set_size_request(rendered.width, rendered.height)
+        self._page_fixed.set_size_request(rendered.width, rendered.height)
+        self._page_width = rendered.width
+        self._page_height = rendered.height
+        if self._annotation_editor is None or self._close_annotation_editor(save=True):
+            self._refresh_annotation_markers()
         self._update_reader_controls()
 
         if self._reset_scroll_on_render:
@@ -772,6 +1256,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._zoom_out_button.set_sensitive(has_document)
         self._zoom_in_button.set_sensitive(has_document)
         self._fit_button.set_sensitive(has_document)
+        self._annotate_button.set_sensitive(has_document)
 
         if has_document:
             self._page_entry.set_text(str(self._current_page + 1))
@@ -785,6 +1270,13 @@ class ReaderWindow(Gtk.ApplicationWindow):
             if self._fit_button.get_active():
                 self._fit_button.set_active(False)
 
+        if self._annotation_mode:
+            self._update_annotation_prompt()
+
+    def _focus_is_text_input(self) -> bool:
+        focus = self.get_focus()
+        return isinstance(focus, (Gtk.Editable, Gtk.TextView))
+
     def _on_key_pressed(
         self,
         _controller: Gtk.EventControllerKey,
@@ -792,9 +1284,21 @@ class ReaderWindow(Gtk.ApplicationWindow):
         _keycode: int,
         state: Gdk.ModifierType,
     ) -> bool:
-        """Handle reader shortcuts while leaving page-entry typing alone."""
+        """Handle reader shortcuts without stealing focus from text inputs."""
 
-        if self._page_entry.has_focus():
+        if keyval == Gdk.KEY_Escape:
+            if self._annotation_editor is not None:
+                self._close_annotation_editor(save=True)
+                return True
+            if self._annotation_mode:
+                self._set_annotation_mode(False)
+                return True
+            if self.is_fullscreen():
+                self.unfullscreen()
+                return True
+            return False
+
+        if self._annotation_editor is not None or self._focus_is_text_input():
             return False
 
         control = bool(state & Gdk.ModifierType.CONTROL_MASK)
@@ -819,8 +1323,18 @@ class ReaderWindow(Gtk.ApplicationWindow):
         if keyval == Gdk.KEY_F11:
             self._toggle_fullscreen()
             return True
-        if keyval == Gdk.KEY_Escape and self.is_fullscreen():
-            self.unfullscreen()
+        shortcut_modifiers = (
+            Gdk.ModifierType.CONTROL_MASK
+            | Gdk.ModifierType.ALT_MASK
+            | Gdk.ModifierType.META_MASK
+            | Gdk.ModifierType.SUPER_MASK
+        )
+        if (
+            keyval in (Gdk.KEY_a, Gdk.KEY_A)
+            and not state & shortcut_modifiers
+            and self._document is not None
+        ):
+            self._set_annotation_mode(not self._annotation_mode)
             return True
         if keyval == Gdk.KEY_space and state & Gdk.ModifierType.SHIFT_MASK:
             self._go_to_page(self._current_page - 1)
@@ -846,7 +1360,11 @@ class ReaderWindow(Gtk.ApplicationWindow):
         delta_y: float,
     ) -> bool:
         state = controller.get_current_event_state()
-        if not state & Gdk.ModifierType.CONTROL_MASK or self._document is None:
+        if (
+            not state & Gdk.ModifierType.CONTROL_MASK
+            or self._document is None
+            or self._annotation_editor is not None
+        ):
             return False
         if delta_y < 0:
             self._adjust_zoom(ZOOM_STEP)
@@ -886,6 +1404,13 @@ class ReaderWindow(Gtk.ApplicationWindow):
             self._render_future.cancel()
 
     def _on_close_request(self, _window: Gtk.Window) -> bool:
+        if not self._close_annotation_editor(save=True):
+            print(
+                "Unable to save the open annotation before closing; closing with the editor note unchanged.",
+                file=sys.stderr,
+            )
+            self._destroy_annotation_editor()
+        self._set_annotation_mode(False)
         self._persist_current_document()
         if not self.is_fullscreen():
             self._settings.set_window_size(self.get_width(), self.get_height())

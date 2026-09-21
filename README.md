@@ -1,9 +1,9 @@
 # PDF Ebook Reader
 
-A small native GTK 4 PDF reader for Linux. Phase 4 provides local PDF opening,
+A small native GTK 4 PDF reader for Linux. It provides local PDF opening,
 page navigation, fit/manual zoom, scrolling, fullscreen, drag-and-drop opening,
 recent-book persistence, reading-position restoration, and bounded background
-rendering.
+rendering, and lightweight local annotations.
 
 ## Requirements
 
@@ -47,14 +47,20 @@ PYTHONPATH=src python -m ebook_reader --check-dependencies
 While reading, use `Previous`/`Next` or the page field to navigate. Keyboard
 shortcuts include `Left`/`Right`, `Page Up`/`Page Down`, `Space`, `Home`, and
 `End`; `Ctrl+0` fits the page, `Ctrl++`/`Ctrl+-` adjust zoom, `F11` toggles
-fullscreen, and `Ctrl+O` opens another PDF. Hold `Ctrl` while using the mouse
+fullscreen, and `Ctrl+O` opens another PDF. Press `A` or use `Annotate` to
+place a numbered marker on the current page; the marker opens a local note
+editor. Press `Esc` to cancel placement. Hold `Ctrl` while using the mouse
 wheel to change zoom. A PDF can also be dropped onto the window.
 
 The reader stores a small amount of per-user state in
 `~/.local/state/pdf-ebook-reader/state.json` (or `$XDG_STATE_HOME`): recent
 absolute paths, matching file metadata, the last page and zoom mode, and the
 last non-fullscreen window size. PDFs remain in their original locations and
-are never copied or uploaded.
+are never copied or uploaded. Annotations are stored separately in
+`~/.local/state/pdf-ebook-reader/annotations.json` (or `$XDG_STATE_HOME`).
+They are local application-owned overlays, matched to the PDF path, size, and
+modification time; they are never embedded in, copied with, or uploaded from
+the source PDF.
 
 ## Install as a Python project
 
