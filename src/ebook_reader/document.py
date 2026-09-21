@@ -11,6 +11,8 @@ gi.require_version("Gio", "2.0")
 gi.require_version("Poppler", "0.18")
 from gi.repository import Gio, GLib, Poppler  # noqa: E402
 
+from .settings import DocumentIdentity
+
 
 class DocumentError(Exception):
     """Base class for errors that can be shown directly to the user."""
@@ -61,6 +63,11 @@ class PdfDocument:
     def __init__(self, *, path: Path, document: Poppler.Document) -> None:
         self.path = path
         self._document = document
+
+        try:
+            self.identity = DocumentIdentity.from_path(path)
+        except OSError as error:
+            raise DocumentAccessError("The selected PDF is no longer available.") from error
 
         try:
             self.page_count = document.get_n_pages()

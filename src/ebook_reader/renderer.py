@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import cairo
@@ -19,6 +20,8 @@ MAX_MANUAL_SCALE = 3.0
 ZOOM_STEP = 1.25
 MAX_RENDER_DIMENSION = 4096
 MAX_RENDER_PIXELS = 16_000_000
+MAX_RENDER_BYTES = MAX_RENDER_PIXELS * 4
+MAX_CACHE_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -28,6 +31,88 @@ class RenderedPage:
     texture: Gdk.Texture
     width: int
     height: int
+
+    @property
+    def memory_bytes(self) -> int:
+        """Return the approximate Cairo/GDK storage cost of this page."""
+
+        return self.width * self.height * 4
+
+
+@dataclass(frozen=True)
+class RenderCacheKey:
+    """Identify a rendered page at one document and zoom level."""
+
+    document_id: str
+    page_index: int
+    zoom_mode: str
+    scale: float
+
+
+class RenderCache:
+    """A small LRU cache with a strict approximate pixel-memory budget."""
+
+    def __init__(self, *, max_bytes: int = MAX_CACHE_BYTES) -> None:
+        if max_bytes <= 0:
+            raise ValueError("Cache size must be positive")
+        self.max_bytes = max_bytes
+        self._entries: OrderedDict[RenderCacheKey, RenderedPage] = OrderedDict()
+        self._bytes = 0
+
+    @property
+    def bytes_used(self) -> int:
+        return self._bytes
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get(self, key: RenderCacheKey) -> RenderedPage | None:
+        page = self._entries.get(key)
+        if page is not None:
+            self._entries.move_to_end(key)
+        return page
+
+    def put(self, key: RenderCacheKey, page: RenderedPage) -> bool:
+        """Store a page unless it cannot fit inside the strict cache budget."""
+
+        self._remove(key)
+        if page.memory_bytes > self.max_bytes:
+            return False
+
+        self._entries[key] = page
+        self._bytes += page.memory_bytes
+        while self._bytes > self.max_bytes and self._entries:
+            _old_key, old_page = self._entries.popitem(last=False)
+            self._bytes -= old_page.memory_bytes
+        return True
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._bytes = 0
+
+    def prune_around(
+        self,
+        *,
+        document_id: str,
+        page_index: int,
+        zoom_mode: str,
+        scale: float,
+    ) -> None:
+        """Keep only the current/adjacent pages at the active scale."""
+
+        for key in list(self._entries):
+            if (
+                key.document_id != document_id
+                or key.zoom_mode != zoom_mode
+                or abs(key.page_index - page_index) > 1
+                or not math.isclose(key.scale, scale, rel_tol=0.0, abs_tol=1e-6)
+            ):
+                self._remove(key)
+
+    def _remove(self, key: RenderCacheKey) -> None:
+        page = self._entries.pop(key, None)
+        if page is not None:
+            self._bytes -= page.memory_bytes
 
 
 def clamp_manual_scale(scale: float) -> float:
@@ -44,10 +129,14 @@ def fit_scale_for_viewport(
 ) -> float:
     """Return the largest aspect-preserving scale that fits the viewport."""
 
-    if page_width <= 0 or page_height <= 0:
+    if (
+        page_width <= 0
+        or page_height <= 0
+        or viewport_width <= 0
+        or viewport_height <= 0
+        or not all(math.isfinite(value) for value in (page_width, page_height, viewport_width, viewport_height))
+    ):
         raise ValueError("PDF page has invalid dimensions")
-    if viewport_width <= 0 or viewport_height <= 0:
-        raise ValueError("Viewport dimensions must be positive")
 
     return min(viewport_width / page_width, viewport_height / page_height)
 
@@ -55,22 +144,39 @@ def fit_scale_for_viewport(
 def _render_dimensions(width: float, height: float, scale: float) -> tuple[int, int]:
     """Calculate safe pixel dimensions while preserving the page aspect ratio."""
 
-    if width <= 0 or height <= 0:
+    if (
+        width <= 0
+        or height <= 0
+        or scale <= 0
+        or not all(math.isfinite(value) for value in (width, height, scale))
+    ):
         raise ValueError("PDF page has invalid dimensions")
-    if scale <= 0:
-        raise ValueError("Render scale must be positive")
 
-    requested_width = max(1, math.ceil(width * scale))
-    requested_height = max(1, math.ceil(height * scale))
+    try:
+        requested_width = max(1, math.ceil(width * scale))
+        requested_height = max(1, math.ceil(height * scale))
+    except (OverflowError, ValueError) as error:
+        raise ValueError("Requested PDF render is too large") from error
+
+    requested_pixels = requested_width * requested_height
+    try:
+        pixel_scale = math.sqrt(MAX_RENDER_PIXELS / requested_pixels)
+    except (OverflowError, ZeroDivisionError, ValueError):
+        pixel_scale = 0.0
     scale_limit = min(
         1.0,
         MAX_RENDER_DIMENSION / requested_width,
         MAX_RENDER_DIMENSION / requested_height,
-        math.sqrt(MAX_RENDER_PIXELS / (requested_width * requested_height)),
+        pixel_scale,
     )
+    safe_width = max(1, math.floor(requested_width * scale_limit))
+    safe_height = max(1, math.floor(requested_height * scale_limit))
+    while safe_width * safe_height * 4 > MAX_RENDER_BYTES:
+        safe_width = max(1, safe_width // 2)
+        safe_height = max(1, safe_height // 2)
     return (
-        max(1, math.floor(requested_width * scale_limit)),
-        max(1, math.floor(requested_height * scale_limit)),
+        safe_width,
+        safe_height,
     )
 
 
