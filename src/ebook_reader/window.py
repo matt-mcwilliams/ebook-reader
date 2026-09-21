@@ -1806,10 +1806,20 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 return True
             return False
 
+        control = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        if (
+            control
+            and keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+            and self._annotation_editor is not None
+            and self._annotation_note_view is not None
+            and self.get_focus() is self._annotation_note_view
+        ):
+            self._close_annotation_editor(save=True)
+            return True
+
         if self._annotation_editor is not None or self._focus_is_text_input():
             return False
 
-        control = bool(state & Gdk.ModifierType.CONTROL_MASK)
         if control and keyval in (Gdk.KEY_c, Gdk.KEY_C) and self._selected_text:
             self._copy_selected_text()
             return True
