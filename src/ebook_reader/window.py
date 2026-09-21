@@ -209,7 +209,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 background: alpha(@accent_bg_color, 0.35);
             }
             .selection-highlight {
-                color: @accent_bg_color;
+                color: #8ecbff;
             }
             .annotation-prompt,
             .annotation-feedback,
@@ -464,7 +464,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
             return
         color = area.get_color()
         context.save()  # type: ignore[attr-defined]
-        context.set_source_rgba(color.red, color.green, color.blue, 0.30)  # type: ignore[attr-defined]
+        context.set_source_rgba(color.red, color.green, color.blue, 0.42)  # type: ignore[attr-defined]
         for rectangle in self._selection_highlights:
             context.rectangle(
                 round(rectangle.x),
