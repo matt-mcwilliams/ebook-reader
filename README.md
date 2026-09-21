@@ -1,6 +1,6 @@
 # PDF Ebook Reader
 
-A small native GTK 4 PDF reader for Linux. The project is being built in phases; Phase 1 provides the project skeleton, dependency check, and an empty application window.
+A small native GTK 4 PDF reader for Linux. Phase 2 provides local PDF opening and a centered first-page reading view.
 
 ## Requirements
 
@@ -25,13 +25,24 @@ From the repository root:
 PYTHONPATH=src python -m ebook_reader
 ```
 
+Open a PDF directly from the terminal:
+
+```bash
+PYTHONPATH=src python -m ebook_reader /path/to/book.pdf
+```
+
+You can also use the `Open PDF` button inside the application. The chooser
+defaults to PDF files, and invalid, unreadable, and protected documents show a
+recoverable error state.
+
 The startup dependency check can be run without opening a window:
 
 ```bash
 PYTHONPATH=src python -m ebook_reader --check-dependencies
 ```
 
-The optional PDF argument and reader controls will be added in Phase 2 and later.
+Page navigation, zoom, scrolling controls, and drag-and-drop opening are planned
+for Phase 3.
 
 ## Install as a Python project
 
