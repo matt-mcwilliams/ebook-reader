@@ -311,6 +311,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
 
         self._page_frame = Gtk.Frame()
         self._page_frame.add_css_class("reader-page")
+        self._page_frame.update_property(
+            [Gtk.AccessibleProperty.DESCRIPTION],
+            ["PDF text can be selected by dragging and copied with Ctrl+C."],
+        )
         self._page_frame.set_child(self._page_fixed)
         self._page_frame.set_halign(Gtk.Align.CENTER)
         self._page_frame.set_valign(Gtk.Align.CENTER)
@@ -1021,6 +1025,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         marker = self._annotation_marker_buttons.get(annotation.id)
         if document is None or marker is None:
             return
+        self._clear_text_selection()
         if self._annotation_editor is not None:
             if self._annotation_editor_annotation_id == annotation.id:
                 if self._annotation_note_view is not None:
@@ -1340,6 +1345,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
 
         if not self._close_annotation_editor(save=True):
             return
+        self._clear_text_selection()
         self._set_annotation_mode(False)
 
         if isinstance(file, Gio.File):
@@ -1420,6 +1426,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _show_error(self, message: str) -> None:
+        self._clear_text_selection()
         if not self._close_annotation_editor(save=True):
             # Keep the editor and its unsaved text available for retry rather
             # than replacing it with an error page that would lose the note.
@@ -1430,7 +1437,14 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._document = None
         self._page_width = 0
         self._page_height = 0
+        self._displayed_page = None
+        self._displayed_page_document = None
+        self._displayed_page_index = None
+        self._displayed_render_generation = None
+        self._displayed_source_width = 0.0
+        self._displayed_source_height = 0.0
         self._refresh_annotation_markers()
+        self._update_page_cursor()
         self._update_reader_controls()
         self._render_generation += 1
         self._cancel_pending_render()
@@ -1453,6 +1467,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
             return
         if not self._close_annotation_editor(save=True):
             return
+        self._clear_text_selection()
 
         clamped = max(0, min(index, self._document.page_count - 1))
         if clamped == self._current_page:
@@ -1678,12 +1693,41 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._last_render_scale = scale
         self._page_picture.set_paintable(rendered.texture)
         self._page_picture.set_size_request(rendered.width, rendered.height)
+        self._selection_overlay.set_size_request(rendered.width, rendered.height)
         self._page_fixed.set_size_request(rendered.width, rendered.height)
         self._page_width = rendered.width
         self._page_height = rendered.height
+
+        try:
+            displayed_page = document.page(self._current_page)
+            source_width, source_height = displayed_page.get_size()
+            if source_width <= 0 or source_height <= 0:
+                raise ValueError("PDF page has invalid dimensions")
+        except (DocumentError, GLib.Error, TypeError, ValueError):
+            displayed_page = None
+            source_width = 0.0
+            source_height = 0.0
+        self._displayed_page = displayed_page
+        self._displayed_page_document = document
+        self._displayed_page_index = self._current_page
+        self._displayed_render_generation = generation
+        self._displayed_source_width = float(source_width)
+        self._displayed_source_height = float(source_height)
+
+        if (
+            self._text_selection is not None
+            and (
+                self._text_selection.page_index != self._current_page
+                or self._displayed_page_document is not self._document
+            )
+        ):
+            self._clear_text_selection()
+        else:
+            self._refresh_selection_highlight()
         if self._annotation_editor is None or self._close_annotation_editor(save=True):
             self._refresh_annotation_markers()
         self._update_reader_controls()
+        self._update_page_cursor()
 
         if self._reset_scroll_on_render:
             self._reader_scrolled.get_vadjustment().set_value(0)
@@ -1754,6 +1798,9 @@ class ReaderWindow(Gtk.ApplicationWindow):
             if self._annotation_mode:
                 self._set_annotation_mode(False)
                 return True
+            if self._selected_text:
+                self._clear_text_selection()
+                return True
             if self.is_fullscreen():
                 self.unfullscreen()
                 return True
@@ -1763,6 +1810,9 @@ class ReaderWindow(Gtk.ApplicationWindow):
             return False
 
         control = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        if control and keyval in (Gdk.KEY_c, Gdk.KEY_C) and self._selected_text:
+            self._copy_selected_text()
+            return True
         if control and keyval in (Gdk.KEY_o, Gdk.KEY_O):
             self._on_open_clicked()
             return True
@@ -1865,6 +1915,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
             self._render_future.cancel()
 
     def _on_close_request(self, _window: Gtk.Window) -> bool:
+        self._clear_text_selection()
         if not self._close_annotation_editor(save=True):
             print(
                 "Unable to save the open annotation before closing; closing with the editor note unchanged.",
