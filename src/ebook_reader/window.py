@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import sys
 from pathlib import Path
 
@@ -15,14 +17,33 @@ from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 from .document import DocumentError, PdfDocument
 from .renderer import (
     DEFAULT_SCALE,
+    RenderCache,
+    RenderCacheKey,
+    RenderedPage,
     ZOOM_STEP,
     clamp_manual_scale,
     fit_scale_for_viewport,
     render_page,
 )
+from .settings import SettingsStore
 
 
 APPLICATION_TITLE = "PDF Ebook Reader"
+
+
+@dataclass(frozen=True)
+class _RenderRequest:
+    generation: int
+    document: PdfDocument
+    page_index: int
+    scale: float
+    cache_key: RenderCacheKey
+
+
+def _render_page_job(page: object, scale: float) -> RenderedPage:
+    """Render one page away from GTK's main loop."""
+
+    return render_page(page, scale=scale)  # type: ignore[arg-type]
 
 
 def _centered_box(*, spacing: int = 12) -> Gtk.Box:
@@ -43,13 +64,27 @@ class ReaderWindow(Gtk.ApplicationWindow):
 
     def __init__(self, *, application: Gtk.Application) -> None:
         super().__init__(application=application)
+        self._settings = SettingsStore()
+        if self._settings.prune_missing():
+            self._save_settings()
+
         self.set_title(APPLICATION_TITLE)
         self.set_default_size(1000, 750)
+        saved_window_size = self._settings.window_size
+        if saved_window_size is not None:
+            self.set_default_size(*saved_window_size)
 
         self._document: PdfDocument | None = None
         self._load_generation = 0
         self._render_generation = 0
         self._render_idle_id: int | None = None
+        self._render_future: Future[RenderedPage] | None = None
+        self._render_request: _RenderRequest | None = None
+        self._render_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="pdf-reader-render",
+        )
+        self._render_cache = RenderCache()
         self._fit_timeout_id: int | None = None
         self._current_page = 0
         self._zoom_mode = "fit"
@@ -57,6 +92,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._last_render_scale = DEFAULT_SCALE
         self._reset_scroll_on_render = True
         self._file_dialog: Gtk.FileDialog | None = None
+        self._closing = False
 
         self._title_label = Gtk.Label(label=APPLICATION_TITLE)
         self._title_label.set_max_width_chars(48)
@@ -82,6 +118,8 @@ class ReaderWindow(Gtk.ApplicationWindow):
 
         self._install_css()
         self._install_input_controllers()
+        self.connect("close-request", self._on_close_request)
+        self._refresh_recent_books()
         self._show_state("empty")
 
     def _install_css(self) -> None:
@@ -132,10 +170,15 @@ class ReaderWindow(Gtk.ApplicationWindow):
         hint.set_wrap(True)
         hint.set_justify(Gtk.Justification.CENTER)
 
+        self._recent_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._recent_box.set_width_request(420)
+        self._recent_box.set_margin_top(12)
+
         content.append(title)
         content.append(subtitle)
         content.append(open_button)
         content.append(hint)
+        content.append(self._recent_box)
         return content
 
     def _build_loading_state(self) -> Gtk.Widget:
@@ -174,6 +217,16 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._page_area.set_margin_bottom(24)
         self._page_area.append(self._page_frame)
 
+        self._page_overlay = Gtk.Overlay()
+        self._page_overlay.set_child(self._page_area)
+        self._render_spinner = Gtk.Spinner()
+        self._render_spinner.set_halign(Gtk.Align.END)
+        self._render_spinner.set_valign(Gtk.Align.START)
+        self._render_spinner.set_margin_top(12)
+        self._render_spinner.set_margin_end(12)
+        self._render_spinner.set_visible(False)
+        self._page_overlay.add_overlay(self._render_spinner)
+
         reader = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         reader.set_hexpand(True)
         reader.set_vexpand(True)
@@ -182,7 +235,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._reader_scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self._reader_scrolled.set_hexpand(True)
         self._reader_scrolled.set_vexpand(True)
-        self._reader_scrolled.set_child(self._page_area)
+        self._reader_scrolled.set_child(self._page_overlay)
         reader.append(self._reader_scrolled)
         reader.append(self._build_reader_controls())
 
@@ -296,6 +349,38 @@ class ReaderWindow(Gtk.ApplicationWindow):
     def _show_state(self, name: str) -> None:
         self._stack.set_visible_child_name(name)
 
+    def _refresh_recent_books(self) -> None:
+        """Rebuild the empty-state recent list from currently valid entries."""
+
+        if not hasattr(self, "_recent_box"):
+            return
+
+        child = self._recent_box.get_first_child()
+        while child is not None:
+            next_child = child.get_next_sibling()
+            self._recent_box.remove(child)
+            child = next_child
+
+        books = self._settings.recent_books
+        if not books:
+            self._recent_box.set_visible(False)
+            return
+
+        self._recent_box.set_visible(True)
+        heading = Gtk.Label(label="Recent books")
+        heading.add_css_class("heading")
+        heading.set_halign(Gtk.Align.START)
+        self._recent_box.append(heading)
+        for book in books:
+            button = Gtk.Button(label=Path(book.identity.path).name)
+            button.set_halign(Gtk.Align.FILL)
+            button.set_tooltip_text(book.identity.path)
+            button.connect(
+                "clicked",
+                lambda _button, path=book.identity.path: self.open_file(path),
+            )
+            self._recent_box.append(button)
+
     def _on_open_clicked(self, _button: Gtk.Button | None = None) -> None:
         self._file_dialog = Gtk.FileDialog()
         self._file_dialog.set_title("Open PDF")
@@ -340,8 +425,11 @@ class ReaderWindow(Gtk.ApplicationWindow):
         else:
             path = str(file)
 
+        self._persist_current_document()
         self._load_generation += 1
         self._render_generation += 1
+        self._cancel_pending_render()
+        self._render_cache.clear()
         generation = self._load_generation
         self._document = None
         self._current_page = 0
@@ -375,10 +463,26 @@ class ReaderWindow(Gtk.ApplicationWindow):
             return GLib.SOURCE_REMOVE
 
         self._document = document
-        self._current_page = 0
-        self._zoom_mode = "fit"
-        self._manual_zoom = DEFAULT_SCALE
+        saved = self._settings.find(document.identity)
+        if saved is None:
+            self._current_page = 0
+            self._zoom_mode = "fit"
+            self._manual_zoom = DEFAULT_SCALE
+        else:
+            self._current_page = max(0, min(saved.page, document.page_count - 1))
+            self._zoom_mode = saved.zoom_mode
+            self._manual_zoom = clamp_manual_scale(saved.manual_zoom)
+        self._last_render_scale = self._manual_zoom
         self._reset_scroll_on_render = True
+        self._render_cache.clear()
+        self._settings.remember(
+            document.identity,
+            page=self._current_page,
+            zoom_mode=self._zoom_mode,
+            manual_zoom=self._manual_zoom,
+        )
+        self._save_settings()
+        self._refresh_recent_books()
         self._update_reader_controls()
         self._title_label.set_text(document.title)
         self.set_title(document.title)
@@ -389,6 +493,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
     def _show_error(self, message: str) -> None:
         self._document = None
         self._render_generation += 1
+        self._cancel_pending_render()
+        self._render_cache.clear()
+        self._render_spinner.stop()
+        self._render_spinner.set_visible(False)
         self._error_label.set_text(message)
         self._show_state("error")
 
@@ -412,6 +520,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._current_page = clamped
         self._reset_scroll_on_render = True
         self._update_reader_controls()
+        self._persist_current_document()
         self._queue_render()
 
     def _on_page_entry_activate(self, entry: Gtk.Entry) -> None:
@@ -448,6 +557,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._reset_scroll_on_render = False
         self._fit_button.set_active(False)
         self._update_reader_controls()
+        self._persist_current_document()
         self._queue_render()
 
     def _on_fit_toggled(self, button: Gtk.ToggleButton) -> None:
@@ -462,6 +572,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
             self._zoom_mode = "manual"
         self._reset_scroll_on_render = False
         self._update_reader_controls()
+        self._persist_current_document()
         self._queue_render()
 
     def _on_reader_size_changed(self, _widget: Gtk.ScrolledWindow, _param: object) -> None:
@@ -485,10 +596,19 @@ class ReaderWindow(Gtk.ApplicationWindow):
         """Coalesce render requests so only the newest page/zoom wins."""
 
         self._render_generation += 1
-        if self._render_idle_id is None:
-            self._render_idle_id = GLib.idle_add(self._render_current_page)
+        self._schedule_render_start()
 
-    def _render_current_page(self) -> bool:
+    def _schedule_render_start(self) -> None:
+        if (
+            self._closing
+            or self._document is None
+            or self._render_idle_id is not None
+            or self._render_future is not None
+        ):
+            return
+        self._render_idle_id = GLib.idle_add(self._start_render)
+
+    def _start_render(self) -> bool:
         self._render_idle_id = None
         document = self._document
         if document is None:
@@ -499,7 +619,19 @@ class ReaderWindow(Gtk.ApplicationWindow):
             page = document.page(self._current_page)
             source_width, source_height = page.get_size()
             scale = self._requested_render_scale(source_width, source_height)
-            rendered = render_page(page, scale=scale)
+            cache_key = RenderCacheKey(
+                document_id=document.identity.key,
+                page_index=self._current_page,
+                zoom_mode=self._zoom_mode,
+                scale=round(scale, 6),
+            )
+            self._render_cache.prune_around(
+                document_id=document.identity.key,
+                page_index=self._current_page,
+                zoom_mode=self._zoom_mode,
+                scale=cache_key.scale,
+            )
+            cached = self._render_cache.get(cache_key)
         except DocumentError as error:
             if generation == self._render_generation:
                 self._show_error(error.user_message)
@@ -513,8 +645,87 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 self._show_error("This page could not be rendered.")
             return GLib.SOURCE_REMOVE
 
-        if document is not self._document or generation != self._render_generation:
+        if cached is not None:
+            self._apply_rendered_page(cached, scale, generation, document)
             return GLib.SOURCE_REMOVE
+
+        request = _RenderRequest(
+            generation=generation,
+            document=document,
+            page_index=self._current_page,
+            scale=scale,
+            cache_key=cache_key,
+        )
+        self._render_request = request
+        self._render_spinner.set_visible(True)
+        self._render_spinner.start()
+        try:
+            future = self._render_executor.submit(_render_page_job, page, scale)
+        except RuntimeError:
+            self._render_spinner.stop()
+            self._render_spinner.set_visible(False)
+            if generation == self._render_generation:
+                self._show_error("The page renderer could not be started.")
+            return GLib.SOURCE_REMOVE
+        self._render_future = future
+        future.add_done_callback(
+            lambda completed: GLib.idle_add(self._finish_render, request, completed)
+        )
+        return GLib.SOURCE_REMOVE
+
+    def _finish_render(
+        self,
+        request: _RenderRequest,
+        future: Future[RenderedPage],
+    ) -> bool:
+        if future is not self._render_future:
+            return GLib.SOURCE_REMOVE
+
+        self._render_future = None
+        self._render_request = None
+        self._render_spinner.stop()
+        self._render_spinner.set_visible(False)
+
+        if self._closing:
+            return GLib.SOURCE_REMOVE
+
+        try:
+            rendered = future.result()
+        except CancelledError:
+            self._schedule_render_start()
+            return GLib.SOURCE_REMOVE
+        except DocumentError as error:
+            if request.generation == self._render_generation:
+                self._show_error(error.user_message)
+            return GLib.SOURCE_REMOVE
+        except Exception as error:  # pragma: no cover - defensive UI boundary
+            print(
+                f"Unable to render page {request.page_index + 1} of "
+                f"{request.document.path!s}: {error}",
+                file=sys.stderr,
+            )
+            if request.generation == self._render_generation:
+                self._show_error("This page could not be rendered.")
+            return GLib.SOURCE_REMOVE
+
+        if request.document is not self._document or request.generation != self._render_generation:
+            self._schedule_render_start()
+            return GLib.SOURCE_REMOVE
+
+        self._render_cache.put(request.cache_key, rendered)
+        self._apply_rendered_page(rendered, request.scale, request.generation, request.document)
+        return GLib.SOURCE_REMOVE
+
+    def _apply_rendered_page(
+        self,
+        rendered: RenderedPage,
+        scale: float,
+        generation: int,
+        document: PdfDocument,
+    ) -> None:
+        if document is not self._document or generation != self._render_generation:
+            self._schedule_render_start()
+            return
 
         self._last_render_scale = scale
         self._page_picture.set_paintable(rendered.texture)
@@ -524,7 +735,6 @@ class ReaderWindow(Gtk.ApplicationWindow):
         if self._reset_scroll_on_render:
             self._reader_scrolled.get_vadjustment().set_value(0)
             self._reset_scroll_on_render = False
-        return GLib.SOURCE_REMOVE
 
     def _requested_render_scale(self, page_width: float, page_height: float) -> float:
         if self._zoom_mode == "manual":
@@ -594,6 +804,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 self._zoom_mode = "fit"
                 self._fit_button.set_active(True)
                 self._update_reader_controls()
+                self._persist_current_document()
                 self._queue_render()
             return True
 
@@ -640,6 +851,41 @@ class ReaderWindow(Gtk.ApplicationWindow):
             self.unfullscreen()
         else:
             self.fullscreen()
+
+    def _persist_current_document(self) -> None:
+        document = self._document
+        if document is None:
+            return
+        self._settings.remember(
+            document.identity,
+            page=self._current_page,
+            zoom_mode=self._zoom_mode,
+            manual_zoom=self._manual_zoom,
+        )
+        self._save_settings()
+
+    def _save_settings(self) -> None:
+        try:
+            self._settings.save()
+        except OSError as error:  # pragma: no cover - depends on local filesystem
+            print(f"Unable to save reader state: {error}", file=sys.stderr)
+
+    def _cancel_pending_render(self) -> None:
+        if self._render_idle_id is not None:
+            GLib.source_remove(self._render_idle_id)
+            self._render_idle_id = None
+        if self._render_future is not None:
+            self._render_future.cancel()
+
+    def _on_close_request(self, _window: Gtk.Window) -> bool:
+        self._persist_current_document()
+        if not self.is_fullscreen():
+            self._settings.set_window_size(self.get_width(), self.get_height())
+        self._save_settings()
+        self._closing = True
+        self._cancel_pending_render()
+        self._render_executor.shutdown(wait=False, cancel_futures=True)
+        return False
 
     def _on_file_list_drop(
         self,
