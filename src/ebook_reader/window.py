@@ -282,6 +282,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._page_fixed.set_halign(Gtk.Align.CENTER)
         self._page_fixed.set_valign(Gtk.Align.CENTER)
         self._page_fixed.set_can_target(True)
+        self._page_fixed.set_focusable(True)
         self._page_fixed.put(self._page_picture, 0, 0)
 
         self._selection_overlay = Gtk.DrawingArea()
@@ -1168,6 +1169,12 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._annotation_editor = None
         self._annotation_editor_annotation_id = None
         self._annotation_note_view = None
+        GLib.idle_add(self._focus_page_after_annotation_close)
+
+    def _focus_page_after_annotation_close(self) -> bool:
+        if self._annotation_editor is None:
+            self._page_fixed.grab_focus()
+        return GLib.SOURCE_REMOVE
 
     def _on_annotation_delete_clicked(self, button: Gtk.Button) -> None:
         if self._annotation_editor is None:
