@@ -1162,6 +1162,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
             popover.set_child(None)
             if popover.get_parent() is not None:
                 popover.unparent()
+            self.set_focus(None)
         finally:
             self._annotation_closing_editor = False
         self._annotation_editor = None
