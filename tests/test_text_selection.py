@@ -120,8 +120,9 @@ class TextSelectionTests(unittest.TestCase):
         self.assertEqual(len(highlights), 1)
         highlight = highlights[0]
         self.assertIsInstance(highlight, HighlightRectangle)
-        self.assertAlmostEqual(highlight.x, 10 * 801 / 600, places=6)
-        self.assertAlmostEqual(highlight.y, 20 * 1201 / 900, places=6)
+        representative_scale = ((801 / 600) + (1201 / 900)) / 2
+        self.assertAlmostEqual(highlight.x, 10 * (801 / 600) / representative_scale, places=6)
+        self.assertAlmostEqual(highlight.y, 20 * (1201 / 900) / representative_scale, places=6)
         assert page.last_rectangle is not None
         self.assertEqual(page.last_rectangle.x1, 10)
         self.assertEqual(page.last_rectangle.x2, 100)
