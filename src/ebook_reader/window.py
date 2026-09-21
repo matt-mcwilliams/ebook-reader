@@ -171,7 +171,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         hint.set_justify(Gtk.Justification.CENTER)
 
         self._recent_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self._recent_box.set_width_request(420)
+        self._recent_box.set_size_request(420, -1)
         self._recent_box.set_margin_top(12)
 
         content.append(title)
