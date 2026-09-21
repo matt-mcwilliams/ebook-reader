@@ -201,6 +201,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
             .annotation-marker:hover {
                 background: shade(@error_color, 0.82);
             }
+            .annotation-marker-resting,
+            .annotation-marker-resting:hover {
+                background: @error_color;
+            }
             .annotation-marker:focus {
                 outline: 3px solid @theme_fg_color;
                 outline-offset: 2px;
@@ -973,6 +977,20 @@ class ReaderWindow(Gtk.ApplicationWindow):
             button.set_size_request(width, height)
             button.set_focusable(True)
             self._update_marker_metadata(button, annotation)
+            motion = Gtk.EventControllerMotion()
+            motion.connect(
+                "enter",
+                lambda _controller, _x, _y, annotation_id=annotation.id: self._on_annotation_marker_pointer_enter(
+                    annotation_id
+                ),
+            )
+            motion.connect(
+                "leave",
+                lambda _controller, annotation_id=annotation.id: self._on_annotation_marker_pointer_leave(
+                    annotation_id
+                ),
+            )
+            button.add_controller(motion)
             button.connect(
                 "clicked",
                 lambda _button, annotation_id=annotation.id: self._on_marker_clicked(annotation_id),
@@ -1013,6 +1031,16 @@ class ReaderWindow(Gtk.ApplicationWindow):
             for left, top, width, height in self._annotation_marker_bounds.values()
         )
 
+    def _on_annotation_marker_pointer_enter(self, annotation_id: str) -> None:
+        marker = self._annotation_marker_buttons.get(annotation_id)
+        if marker is not None:
+            marker.remove_css_class("annotation-marker-resting")
+
+    def _on_annotation_marker_pointer_leave(self, annotation_id: str) -> None:
+        marker = self._annotation_marker_buttons.get(annotation_id)
+        if marker is not None:
+            marker.remove_css_class("annotation-marker-resting")
+
     def _on_marker_clicked(self, annotation_id: str) -> None:
         document = self._document
         if document is None:
@@ -1026,6 +1054,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         marker = self._annotation_marker_buttons.get(annotation.id)
         if document is None or marker is None:
             return
+        marker.remove_css_class("annotation-marker-resting")
         self._clear_text_selection()
         if self._annotation_editor is not None:
             if self._annotation_editor_annotation_id == annotation.id:
@@ -1156,6 +1185,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         popover = self._annotation_editor
         if popover is None:
             return
+        annotation_id = self._annotation_editor_annotation_id
         self._close_annotation_confirmation()
         self._annotation_closing_editor = True
         try:
@@ -1169,6 +1199,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._annotation_editor = None
         self._annotation_editor_annotation_id = None
         self._annotation_note_view = None
+        if annotation_id is not None:
+            marker = self._annotation_marker_buttons.get(annotation_id)
+            if marker is not None:
+                marker.add_css_class("annotation-marker-resting")
         GLib.idle_add(self._focus_page_after_annotation_close)
 
     def _focus_page_after_annotation_close(self) -> bool:
