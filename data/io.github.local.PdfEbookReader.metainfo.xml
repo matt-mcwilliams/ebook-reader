@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.local.PdfEbookReader</id>
+  <name>PDF Ebook Reader</name>
+  <summary>A calm, local-only PDF reading window</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      PDF Ebook Reader opens local PDF files in a focused single-page reading
+      view with keyboard navigation, fit-to-window and manual zoom controls.
+    </p>
+    <p>
+      Reading positions and a small recent-books list are stored locally on
+      the computer. The application does not upload documents or start a
+      network service.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.local.PdfEbookReader.desktop</launchable>
+  <provides>
+    <binary>ebook-reader</binary>
+  </provides>
+  <categories>
+    <category>Office</category>
+    <category>Viewer</category>
+  </categories>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-09-21">
+      <description>
+        <p>Initial MVP release with local PDF reading, persistence, and desktop integration.</p>
+      </description>
+    </release>
+  </releases>
+</component>

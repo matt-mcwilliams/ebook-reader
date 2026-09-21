@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=PDF Ebook Reader
+Comment=Read local PDF books in a calm single-page view
+Exec=ebook-reader %U
+Icon=io.github.local.PdfEbookReader
+Terminal=false
+Type=Application
+Categories=Office;Viewer;
+MimeType=application/pdf;
+StartupNotify=true
+StartupWMClass=io.github.local.PdfEbookReader
+Keywords=PDF;ebook;book;reader;document;

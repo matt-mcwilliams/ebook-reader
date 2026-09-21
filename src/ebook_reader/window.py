@@ -261,6 +261,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._page_entry.set_width_chars(5)
         self._page_entry.set_max_length(7)
         self._page_entry.set_input_purpose(Gtk.InputPurpose.DIGITS)
+        self._set_accessible_label(self._page_entry, "Page number")
         self._page_entry.set_tooltip_text("Go to page number")
         self._page_entry.connect("activate", self._on_page_entry_activate)
 
@@ -276,6 +277,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         separator.set_margin_end(6)
 
         self._zoom_out_button = Gtk.Button(label="−")
+        self._set_accessible_label(self._zoom_out_button, "Zoom out")
         self._zoom_out_button.set_tooltip_text("Zoom out (Ctrl+- or Ctrl+mouse wheel)")
         self._zoom_out_button.connect("clicked", self._on_zoom_out_clicked)
 
@@ -284,10 +286,12 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._zoom_label.set_xalign(0.5)
 
         self._zoom_in_button = Gtk.Button(label="+")
+        self._set_accessible_label(self._zoom_in_button, "Zoom in")
         self._zoom_in_button.set_tooltip_text("Zoom in (Ctrl++ or Ctrl+mouse wheel)")
         self._zoom_in_button.connect("clicked", self._on_zoom_in_clicked)
 
         self._fit_button = Gtk.ToggleButton(label="Fit")
+        self._set_accessible_label(self._fit_button, "Fit page to window")
         self._fit_button.set_tooltip_text("Fit the page to the window (Ctrl+0)")
         self._fit_button.connect("toggled", self._on_fit_toggled)
 
@@ -305,6 +309,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
             controls.append(child)
 
         return controls
+
+    @staticmethod
+    def _set_accessible_label(widget: Gtk.Widget, label: str) -> None:
+        widget.update_property([Gtk.AccessibleProperty.LABEL], [label])
 
     def _install_input_controllers(self) -> None:
         """Install keyboard, wheel-zoom, and file-drop input handling."""

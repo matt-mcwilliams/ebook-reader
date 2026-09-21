@@ -66,4 +66,25 @@ python -m venv --system-site-packages .venv
 .venv/bin/ebook-reader
 ```
 
-The desktop launcher and per-user installation scripts are planned for Phase 5.
+## Install as a desktop application
+
+Install the current checkout for the current user without root access:
+
+```bash
+./scripts/install-local.sh
+```
+
+This installs the launcher in `~/.local/bin`, the desktop entry in
+`~/.local/share/applications`, the icon in the user hicolor icon theme, and
+the application files in `~/.local/share/pdf-ebook-reader`. It registers
+`application/pdf` for the normal desktop “Open With” flow. The installer does
+not use `sudo` or modify Hyprland/Omarchy configuration.
+
+Remove only the installed application files with:
+
+```bash
+./scripts/uninstall-local.sh
+```
+
+The uninstall script deliberately leaves reading state in
+`~/.local/state/pdf-ebook-reader` untouched.
