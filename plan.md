@@ -1,413 +1,365 @@
-# Minimal PDF EBook Reader - Implementation Plan
+# PDF Ebook Reader - Annotation Feature Plan
 
 ## 1. Goal
 
-Build a small desktop application for this Omarchy/Arch Linux computer that opens a local PDF and presents it as a calm, book-like reading experience.
+Add lightweight, local annotations to the existing GTK PDF reader.
 
-The first version should:
+A reader should be able to:
 
-- Run as a normal desktop window, not as a website or local web server.
-- Open PDFs from the file picker or from the command line/file manager.
-- Display one page at a time in a centered, distraction-free reading area.
-- Provide only the controls needed to read comfortably.
-- Keep documents on the computer; nothing is uploaded or sent over the network.
-- Remember the last page for recently opened books.
-- Integrate with the application launcher and follow the current system theme.
+- Press `A` or click an annotation button to enter placement mode.
+- Click a location on the visible PDF page.
+- See a red numbered circle at that location.
+- Optionally enter or edit notes associated with the marker.
+- Reopen, edit, or delete an existing annotation.
+- Return to the same PDF later and see its annotations in the same places.
 
-## 2. Deliberate MVP Boundaries
+Annotations are application-owned overlays. They do not alter, embed data in, or create a new copy of the PDF.
 
-### Included
+## 2. Product Decisions and Boundaries
 
-- Open one local PDF at a time.
-- Drag and drop a PDF onto the window.
-- Single-page reading view.
-- Previous/next-page navigation.
-- Direct page-number entry.
-- Keyboard and mouse navigation.
-- Zoom in, zoom out, and fit-to-window behavior.
-- Current page and total page count.
-- Lightweight recent-book and reading-position persistence.
-- Friendly empty, loading, and error states.
-- Per-user desktop installation and launcher entry.
+### Planned behavior
 
-### Not included in the first version
+- Annotation numbers are scoped to one document and increase across all of its pages.
+- A new document starts at annotation `1`.
+- Existing numbers remain stable. Deleting annotation `3` does not renumber later annotations, and the next marker uses the next unused sequence number rather than filling the gap.
+- Notes are optional. Dismissing the note editor with an empty note keeps the numbered marker.
+- Annotation positions are stored relative to the PDF page, so they remain aligned when the page is zoomed, fitted, resized, or reopened.
+- Clicking an existing numbered circle opens its note editor.
+- Deletion is available from the note editor and requires an explicit action.
+- Annotations are stored locally and atomically under the user's XDG state directory.
+- Annotation mode is a one-marker action: after a successful placement, the app returns to normal reading mode.
 
-- PDF editing, annotations, highlights, or bookmarks.
-- Search, table-of-contents extraction, thumbnails, or two-page spreads.
-- EPUB/MOBI support.
-- Accounts, cloud sync, networking, or telemetry.
-- A library/database of imported files.
-- Copying PDFs into an application-managed folder.
-- Digital-rights-management support.
-- Hyprland window rules, global keybindings, or edits to Omarchy configuration.
+### Not included in this feature
 
-These can be considered only after the basic reader is stable and pleasant to use.
+- Writing PDF annotation objects into the source file.
+- Exporting, printing, importing, or sharing annotations.
+- Text highlighting, freehand drawing, shapes, or selecting text ranges.
+- Cloud sync, accounts, collaboration, or cross-device state.
+- Searching, filtering, or displaying a document-wide annotation sidebar.
+- Reordering or manually changing annotation numbers.
+- Undo/redo history beyond deleting or editing an annotation directly.
 
-## 3. Technical Direction
+## 3. User Experience
 
-Use a native GTK 4 application written in Python, with Poppler GLib for PDF loading and page rendering.
+### Entering placement mode
 
-This choice fits the current machine because the required runtime components are already installed:
+Add an `Annotate` toggle button to the reader controls. Its accessible label and tooltip should mention the `A` shortcut.
 
-- Python 3.14
-- GTK 4
-- PyGObject
-- Poppler GLib
+When the user presses `A` or clicks the button:
 
-It also avoids bundling Chromium/Electron, running a local server, or adding a large JavaScript dependency tree.
+1. The button becomes active.
+2. The page cursor changes to a crosshair when practical in GTK.
+3. A short, unobtrusive prompt appears over the reading area: `Click the page to place annotation N · Esc to cancel`.
+4. Navigation and zoom remain visible, but clicking outside the rendered PDF does not create an annotation.
 
-### Core libraries
+Pressing `A` again or `Esc` cancels placement mode. The `A` shortcut must not trigger while focus is in the page-number entry, the annotation note editor, or another text input.
 
-- `Gtk`/`Gdk`/`Gio` via PyGObject: window, controls, dialogs, keyboard input, drag and drop, and application lifecycle.
-- `Poppler` via GObject Introspection: PDF parsing, metadata, page count, page dimensions, and Cairo rendering.
-- `cairo`: render a Poppler page to an image surface shown by GTK.
-- Python standard library: paths, JSON persistence, URI handling, and command-line arguments.
+If no document is open, the annotation action is disabled and `A` has no effect.
 
-### Compatibility assumptions
+### Placing an annotation
 
-- Primary target: this x86_64 Omarchy/Arch Linux installation under Wayland/Hyprland.
-- The application should use GTK's normal Wayland support and must not force XWayland.
-- Packaging for other Linux distributions, macOS, or Windows is outside the MVP.
-- Password-protected PDFs should produce a clear unsupported/protected-document message in the MVP rather than a broken view.
+The click location is converted from rendered-widget coordinates to normalized page coordinates in the inclusive range `0.0` to `1.0` for both axes. This makes the marker independent of current zoom and output resolution.
 
-## 4. User Experience
+After a valid page click:
 
-### Empty state
+1. Create and persist the annotation immediately.
+2. Show a red circular marker centered on the clicked location with the next document-wide number in white.
+3. Leave placement mode.
+4. Open a small editor anchored to the new marker.
+5. Focus the notes field so the user may type immediately.
 
-On launch, show a restrained empty screen with:
+The editor should provide:
 
-- Application name.
-- A single prominent `Open PDF` button.
-- A short hint that a PDF can also be dropped onto the window.
-- A compact recent-books list only when prior books exist.
+- A clear heading such as `Annotation 4`.
+- A multiline notes field.
+- A `Done` action that saves and closes.
+- A `Delete` action for removing the annotation.
 
-### Reading state
+Closing the editor by clicking elsewhere saves the current note. `Esc` closes the editor before it is treated as a request to leave fullscreen. Notes should preserve line breaks and ordinary Unicode text.
 
-The main window should contain:
+### Viewing annotations
 
-1. A slim GTK header bar.
-2. The document title, falling back to the file name.
-3. An `Open` button.
-4. A centered page canvas on a neutral background.
-5. A small bottom control bar with previous, page position, next, zoom, and fit controls.
+- Only annotations belonging to the current PDF page are visible.
+- Markers move and resize with the rendered page while retaining a readable minimum visual size.
+- Marker placement is clamped so the complete circle remains visually reachable near a page edge.
+- Clicking a marker opens the same editor used after creation.
+- Marker tooltips should expose the annotation number and, when present, a short single-line preview of its note.
+- Page navigation closes any open annotation editor and renders the new page's markers.
+- Annotations remain interactive in both fit and manual zoom modes and while the page is inside the scrolled viewport.
 
-The PDF page should look like a physical page: centered, with modest spacing and a subtle shadow or border. Controls should stay visually quiet so the document remains the focus.
+### Deleting annotations
 
-### Minimal controls
+Deleting removes the marker and its note from local storage immediately. Because deletion is permanent and there is no undo in this feature, the editor should ask for confirmation before removal.
 
-- Previous page.
-- Page field formatted conceptually as `12 / 240`.
-- Next page.
-- Zoom out.
-- Zoom percentage or fit indicator.
-- Zoom in.
-- Fit-to-window toggle/action.
+Deletion does not change any surviving annotation number. For example, after deleting `2` from annotations `1`, `2`, and `3`, the next annotation is `4`.
 
-Buttons must have accessible labels and tooltips even if they use icons.
+## 4. Data Model and Persistence
 
-### Keyboard and mouse behavior
+Create a dedicated `annotations.py` module rather than adding durable annotation content to `SettingsStore`. The existing settings file is a bounded recent-books list; annotations must not disappear when a document is no longer recent.
 
-| Input | Action |
-| --- | --- |
-| `Ctrl+O` | Open a PDF |
-| `Right`, `Page Down`, or `Space` | Next page |
-| `Left`, `Page Up`, or `Shift+Space` | Previous page |
-| `Home` | First page |
-| `End` | Last page |
-| `Ctrl++` | Zoom in |
-| `Ctrl+-` | Zoom out |
-| `Ctrl+0` | Fit page to the available window |
-| `F11` | Toggle fullscreen |
-| `Esc` | Leave fullscreen or dismiss a transient UI element |
-| Mouse wheel | Scroll a zoomed page vertically |
-| `Ctrl` + mouse wheel | Adjust zoom |
+### Annotation record
 
-Navigation actions should clamp safely at the first and last pages. When focus is inside the page-number field, typing must take priority over page shortcuts.
+Represent an annotation with a small immutable value object containing:
 
-### Window behavior
+- Stable annotation ID, generated locally (UUID string).
+- Positive display number.
+- Zero-based page index.
+- Normalized `x` and `y` page coordinates.
+- Note text, which may be empty.
+- Creation timestamp in UTC.
+- Last-updated timestamp in UTC.
 
-- Start at a comfortable default size, approximately 1000 x 750 logical pixels.
-- Respect manual resize and fullscreen.
-- Refit the page after a resize when fit mode is enabled.
-- Allow scrolling when the rendered page is larger than the viewport.
-- Use the active GTK light/dark appearance automatically.
-- Do not add custom Hyprland window rules for the MVP.
+Represent a document's annotation collection with:
 
-## 5. Application Architecture
+- Resolved absolute PDF path.
+- PDF file size and modification time, matching `DocumentIdentity`.
+- `next_number`, always greater than every assigned display number.
+- Annotation records sorted by display number for deterministic storage and display.
 
-Keep the project small and separate only the concerns that benefit from being independently testable.
+### Storage
 
-Proposed structure:
+Use a separate versioned JSON file:
 
 ```text
-ebook-reader/
-├── plan.md
-├── README.md
-├── pyproject.toml
-├── src/
-│   └── ebook_reader/
-│       ├── __init__.py
-│       ├── __main__.py
-│       ├── application.py
-│       ├── window.py
-│       ├── document.py
-│       ├── renderer.py
-│       └── settings.py
-├── data/
-│   ├── io.github.local.PdfEbookReader.desktop
-│   ├── io.github.local.PdfEbookReader.metainfo.xml
-│   └── icons/
-├── scripts/
-│   ├── install-local.sh
-│   └── uninstall-local.sh
-└── tests/
-    ├── test_document.py
-    ├── test_settings.py
-    └── fixtures/
+~/.local/state/pdf-ebook-reader/annotations.json
 ```
 
-### Responsibilities
+Respect `$XDG_STATE_HOME` in the same way as the existing reader-state store. Save through a temporary sibling file, flush it, and replace the destination atomically.
 
-- `application.py`: `Gtk.Application`, lifecycle, command-line/open-file handling, actions, and single-instance behavior.
-- `window.py`: window layout, empty/reader/error states, signals, input shortcuts, and presentation state.
-- `document.py`: safe Poppler document wrapper, metadata, page count, page lookup, and document identity.
-- `renderer.py`: page-size calculation, zoom/fit math, Cairo rendering, and the small render cache.
-- `settings.py`: recent files, last page, zoom preference, and window-state persistence.
-- `__main__.py`: a minimal executable entry point.
+The store should:
 
-Avoid a framework or dependency-injection layer. GTK signals and a few clearly owned objects are sufficient for this application.
+- Load a missing or corrupt file as an empty collection without crashing.
+- Validate types, finite coordinates, page indices, IDs, timestamps, and note strings while decoding.
+- Clamp normalized coordinates into the valid range.
+- Ignore malformed individual records while retaining valid records.
+- Enforce unique IDs and unique positive display numbers within a document.
+- Return annotations by current `DocumentIdentity` and page index.
+- Create, update, and delete annotations through narrow methods rather than exposing mutable storage internals.
+- Keep annotation documents independently of the 10-book recent list.
+- Avoid removing records merely because the PDF is temporarily missing.
 
-## 6. State Model
+The initial implementation should require the stored path, file size, and modification time to match the opened PDF. This avoids placing old markers onto changed page content. If a PDF is replaced at the same path, its previous annotations remain in storage but are not shown for the new identity.
 
-Keep a small explicit state object in the window/controller:
+### Suggested JSON shape
 
-- Current document path and identity.
-- Poppler document handle.
-- Current zero-based page index.
-- Total page count.
-- Zoom mode: `fit` or `manual`.
-- Manual zoom value.
-- Loading/rendering status.
-- Last render request generation number.
+```json
+{
+  "version": 1,
+  "documents": [
+    {
+      "path": "/absolute/path/book.pdf",
+      "size": 123456,
+      "mtime_ns": 1700000000000000000,
+      "next_number": 3,
+      "annotations": [
+        {
+          "id": "8c7d6279-794d-4667-867f-5bb4508fef8c",
+          "number": 1,
+          "page": 0,
+          "x": 0.42,
+          "y": 0.31,
+          "note": "Important definition",
+          "created_at": "2026-09-21T18:30:00Z",
+          "updated_at": "2026-09-21T18:35:00Z"
+        }
+      ]
+    }
+  ]
+}
+```
 
-UI controls derive their sensitivity and labels from this state. For example, `Previous` is disabled on page 1, and both navigation buttons are disabled when no document is open.
+## 5. Page Overlay and Coordinate Handling
 
-### Persisted data
+The current `Gtk.Picture` is centered inside a framed page. Introduce a page-sized annotation surface that shares the rendered picture's coordinate system.
 
-Use a small JSON file under the XDG state directory, such as:
+Recommended structure:
 
 ```text
-~/.local/state/pdf-ebook-reader/state.json
+Gtk.Frame (.reader-page)
+└── Gtk.Fixed (exact rendered page size)
+    ├── Gtk.Picture (at 0, 0)
+    └── annotation marker buttons (positioned over the picture)
 ```
 
-Store only:
+Attach a `Gtk.GestureClick` to the page-sized container for placement. Marker button clicks must be handled by the marker itself and must not bubble into creation of another annotation.
 
-- A bounded list of up to 10 recent absolute file paths.
-- Last page for each recent file.
-- Last manual zoom or fit mode.
-- Last non-fullscreen window size.
+When a page render is applied:
 
-Write state atomically through a temporary sibling file followed by replacement. Missing, moved, or unreadable recent files should be ignored gracefully and removed from the list when encountered.
+1. Set both the picture and fixed container to the rendered page dimensions.
+2. Fetch annotations for the current document identity and page.
+3. Convert normalized coordinates to pixels using the actual rendered width and height.
+4. Center marker widgets at those positions and clamp their widget bounds to the page.
+5. Rebuild or reposition markers without changing their stored coordinates.
 
-For the MVP, identify a document by its resolved path plus simple file metadata such as size and modification time. This is inexpensive and prevents restoring an obviously stale page position after a file is replaced.
+Store normalized coordinates from the center of the marker, not its top-left corner. Marker size is presentation state and must never affect the persisted location.
 
-## 7. PDF Loading and Rendering
+Render safety limits can make the texture's actual dimensions differ slightly from `source_size * requested_scale`; all display placement calculations must therefore use the `RenderedPage.width` and `RenderedPage.height` actually applied to the picture.
 
-### Open flow
+## 6. Window State and Interactions
 
-1. Receive a path from the file chooser, drag and drop, command line, or desktop `Open With` action.
-2. Validate that it exists, is a regular readable file, and has a PDF content type or `.pdf` extension.
-3. Convert the local path to a properly escaped file URI for Poppler.
-4. Open the document and read page count/title metadata.
-5. Restore the saved page and zoom mode when available.
-6. Render the requested page and switch to the reading state.
-7. Add the file to recents only after it opens successfully.
+Add explicit annotation UI state to `ReaderWindow`:
 
-### Render sizing
+- `annotation_mode`: whether the next valid page click creates a marker.
+- Current page render width and height.
+- Current annotation popover/editor, if any.
+- Mapping from annotation IDs to visible marker widgets.
+- One `AnnotationStore` instance.
 
-- Read the source page dimensions from Poppler.
-- In fit mode, calculate the largest scale that fits both viewport width and height while preserving aspect ratio and leaving a small margin.
-- In manual mode, use a bounded scale, initially supporting roughly 50% to 300%.
-- Account for the GTK scale factor so output remains sharp on HiDPI displays.
-- Render the page at the required pixel size into a Cairo image surface.
-- Present the surface through a GTK drawing widget or texture without rescaling it a second time.
+Centralize mode changes in a method that updates the button, prompt, cursor, and input behavior together.
 
-### Responsiveness
+Interaction rules:
 
-- Do not render repeatedly for every resize event; debounce fit-mode redraws briefly.
-- Render on a worker thread if normal PDFs cause visible input blocking, then marshal only the completed texture/UI update back to GTK's main thread.
-- Use a monotonically increasing render generation ID so a slow old render cannot replace a newer requested page.
-- Cache at most the current page and adjacent pages at the active zoom level.
-- Set a strict cache limit based on approximate surface memory, and discard old surfaces first.
-- Show a subtle spinner for renders that are not effectively immediate.
+- Opening another document, showing an error, or closing the window cancels annotation mode and closes the editor.
+- Navigating pages closes the editor and refreshes markers.
+- Re-rendering at a new zoom rebuilds marker positions after the new texture is applied.
+- Starting annotation mode closes an existing editor.
+- Opening an existing marker editor cancels placement mode.
+- While the notes field has focus, ordinary reader navigation shortcuts and `A` must not fire.
+- `Ctrl+O`, zoom shortcuts, fullscreen, and existing page navigation retain their current behavior when no annotation editor is active.
+- Saving an annotation error should be logged and presented as a concise, recoverable UI error; it must not crash the reader or silently claim success.
 
-Threading should be introduced only around isolated rendering work. GTK widgets must be accessed only from the main thread. If Poppler object thread-safety is uncertain in practice, create the page/render work in a serialized worker rather than rendering concurrently.
+## 7. Styling and Accessibility
 
-## 8. Errors and Edge Cases
+Add minimal application CSS for:
 
-Handle each case without crashing or leaving controls in an inconsistent state:
+- A red circular marker with white, high-contrast number text.
+- Hover and keyboard-focus states that remain distinguishable.
+- An active annotation-mode button.
+- The placement prompt.
 
-- Cancelled file chooser: do nothing.
-- Missing or unreadable file: explain that the file cannot be accessed.
-- Invalid or corrupt PDF: show a concise error with an option to choose another file.
-- Password-protected PDF: explain that protected documents are not supported yet.
-- Zero-page or malformed document: reject it with a useful message.
-- Very large page: cap render scale/pixel count to avoid excessive memory use.
-- File moved after appearing in recents: remove or disable that recent entry.
-- Document deleted while open: keep the already-open document readable where possible, but report failures on later page access.
-- Rapid page changes: display only the latest requested page.
-- Application closed during rendering: cancel/ignore the outstanding result cleanly.
+Use a fixed logical marker diameter large enough to click comfortably, with enough room for at least three digits. If annotation numbers become too wide, expand the pill/circle enough to keep the number legible rather than truncating it.
 
-Do not display raw stack traces in the UI. Development logs can go to standard error with enough detail to diagnose failures.
+Each marker must be a keyboard-focusable GTK button with an accessible label such as `Annotation 4: Important definition`. An empty annotation should be announced as `Annotation 4, no notes`.
 
-## 9. Local Desktop Integration
+The editor controls need accessible labels, a predictable focus order, and full keyboard operation. Do not rely on red color alone to communicate selection or mode; the prompt and active button state provide redundant cues.
 
-The app should be runnable during development with a project command such as:
+## 8. Error Cases
 
-```bash
-python -m ebook_reader [optional-file.pdf]
-```
+Handle these cases without losing unrelated annotations or destabilizing reading:
 
-The local install script should install only into the current user's directories:
+- Click outside the rendered PDF while placement mode is active: ignore it and remain in placement mode.
+- Page changes before placement: keep placement mode active and update the prompt's next number for the same document.
+- PDF changed on disk: do not apply annotations from the previous document identity.
+- Annotation file missing or corrupt: start with no annotations and preserve a diagnostic on standard error.
+- One malformed record: skip only that record.
+- Atomic save failure during creation: do not show a marker that only exists in memory; report that it could not be saved.
+- Save failure during note editing: keep the editor open with the user's current text so it can be retried or copied.
+- Save failure during deletion: retain the marker and note.
+- Very large annotation number: keep the marker readable and avoid layout overflow.
+- Rapid zoom or page navigation: show markers only for the render generation and page currently displayed.
+- Annotation editor open during app close: commit the current note before shutdown; if saving fails, log the failure because the window can no longer provide a recovery UI.
 
-- Executable/launcher wrapper: `~/.local/bin/`
-- Desktop entry: `~/.local/share/applications/`
-- App icon: `~/.local/share/icons/hicolor/`
-- Application files or virtual environment: an appropriate directory under `~/.local/`
+## 9. Implementation Phases
 
-The `.desktop` entry should:
+### Phase 1 - Annotation model and store
 
-- Launch the application normally under Wayland.
-- Declare `application/pdf` support.
-- Accept a local PDF path/URI via `%U` or `%F`.
-- Include a stable application ID matching `Gtk.Application`.
-- Appear in Omarchy's normal application launcher through the standard desktop-entry mechanism.
+- Add annotation and document-collection value objects.
+- Add versioned JSON decoding and encoding.
+- Implement identity/page queries plus create, update, and delete operations.
+- Implement atomic writes under the XDG state directory.
+- Add unit tests for validation, numbering, CRUD, identity isolation, and failure-safe loading.
 
-The installer must not use `sudo`, edit `~/.config/hypr/`, edit `~/.config/omarchy/`, or write into `/usr/share/omarchy/`. The uninstall script should remove only files created by this project's installer and leave saved reading state alone unless explicitly asked to purge it.
+Deliverable: annotation records can be managed and safely persisted without GTK.
 
-## 10. Implementation Phases
+### Phase 2 - Page overlay and marker display
 
-### Phase 1 - Project skeleton and dependency check
+- Replace the page frame's direct picture child with a page-sized fixed overlay.
+- Render existing page annotations as numbered marker buttons.
+- Reposition markers from normalized coordinates after navigation, resize, fit, and zoom renders.
+- Add marker styling, tooltips, and accessible names.
 
-- Add Python project metadata and the module entry point.
-- Confirm the GObject namespaces for GTK 4 and Poppler load correctly.
-- Add a minimal `Gtk.Application` window.
-- Document the development run command.
-- Add a startup dependency check with an actionable message for missing system packages.
+Deliverable: persisted annotations appear in the correct places at every zoom level.
 
-Deliverable: an empty native window starts reliably from the terminal.
+### Phase 3 - Placement interaction
 
-### Phase 2 - Open and display a PDF
+- Add the `Annotate` control and `A` shortcut.
+- Add one-shot placement mode, prompt, crosshair cursor, and `Esc` cancellation.
+- Convert valid page clicks to normalized coordinates and persist a new marker.
+- Prevent marker/editor interactions from accidentally placing markers.
 
-- Build the file chooser with a PDF filter.
-- Add command-line/open-file handling.
-- Implement the Poppler document wrapper.
-- Render the first page into the centered viewport.
-- Add empty, loading, reader, and error states.
+Deliverable: a user can place correctly numbered markers using mouse and keyboard controls.
 
-Deliverable: a normal local PDF can be selected and read on page 1.
+### Phase 4 - Note editor and deletion
 
-### Phase 3 - Reading controls
+- Add a marker-anchored popover with multiline notes, `Done`, and `Delete`.
+- Open and focus it after marker creation or marker activation.
+- Save edits on `Done` or popover dismissal.
+- Confirm deletion and update the page overlay only after persistence succeeds.
+- Resolve keyboard shortcut and focus interactions.
 
-- Add previous/next controls and page-number entry.
-- Add keyboard shortcuts and boundary behavior.
-- Implement manual zoom and fit-to-window.
-- Add scrolling and fullscreen.
-- Add drag-and-drop opening.
+Deliverable: notes can be created, reopened, edited, and deleted without disrupting reader navigation.
 
-Deliverable: the entire PDF can be navigated comfortably using mouse or keyboard.
+### Phase 5 - Integration polish
 
-### Phase 4 - Persistence and resilience
+- Cover document switching, page switching, save errors, fullscreen, and shutdown.
+- Update `README.md` with annotation behavior, shortcut, storage location, and local-only scope.
+- Run automated tests and complete the manual verification matrix.
+- Re-run the existing reader tests to prevent navigation, rendering, and settings regressions.
 
-- Save and restore last page and zoom mode.
-- Add the bounded recent-books list.
-- Add render generation/cancellation behavior and a small cache.
-- Add pixel/memory safety limits.
-- Polish error messages and malformed-file handling.
+Deliverable: annotations behave reliably as a native part of the existing reader.
 
-Deliverable: reopening a book returns to the prior reading position, and rapid/large-file interactions remain stable.
+## 10. Automated Verification
 
-### Phase 5 - Desktop installation and polish
+Add focused tests for logic that does not require a display server:
 
-- Add the application icon, desktop entry, metadata, and per-user installer/uninstaller.
-- Verify launcher discovery and `Open With` behavior.
-- Check light and dark appearances under the current Omarchy theme.
-- Review focus order, accessible labels, tooltips, and window resizing.
-- Keep custom CSS minimal and limited to the page/background presentation.
+- First annotation number is `1`; subsequent numbers increase document-wide.
+- Deleting a marker does not renumber survivors or reuse its number.
+- Page queries return only the requested page, sorted by number.
+- Notes round-trip Unicode and multiline text.
+- Create, update, and delete survive a reload from disk.
+- Writes use replacement and do not leave a partial destination on failure.
+- Missing, invalid, and partially malformed JSON fail safely.
+- Duplicate IDs or display numbers are rejected or skipped deterministically.
+- Non-finite and out-of-range coordinates cannot escape the valid normalized range.
+- A replaced PDF at the same path does not receive annotations from the old identity.
+- Annotation documents are not pruned when the reader's recent list is trimmed.
+- Coordinate helpers correctly convert between normalized and rendered positions.
+- Edge markers are visually clamped without changing their persisted coordinates.
+- Existing renderer and settings tests continue to pass.
 
-Deliverable: the reader launches like a normal installed desktop application on this Omarchy machine.
+Keep coordinate conversion and validation in small pure functions so these behaviors can be tested without constructing GTK widgets.
 
-## 11. Verification Plan
+## 11. Manual Verification
 
-### Automated tests
+Use a multipage local PDF and verify:
 
-- Page clamping and page-number conversion.
-- Fit-scale calculations across portrait, landscape, and unusually shaped pages.
-- Zoom minimum/maximum enforcement.
-- State-file read/write, atomic replacement, corrupt JSON fallback, and recent-list trimming.
-- Document identity changes when file size or modification time changes.
-- URI/path handling for spaces and non-ASCII characters.
-- Error mapping from Poppler/GLib errors to user-facing messages.
-
-### Manual PDF fixtures
-
-Test with locally generated or freely redistributable fixtures covering:
-
-- A short portrait text document.
-- A landscape document.
-- Mixed page sizes and rotations.
-- Image-heavy/high-resolution pages.
-- A long document for position restoration.
-- A Unicode file name and a path containing spaces.
-- A corrupt/non-PDF file renamed to `.pdf`.
-- A password-protected PDF.
-
-Do not commit private sample books to the repository.
-
-### Desktop checks on Omarchy
-
-- Launch from the terminal with no file.
-- Launch from the terminal with a PDF path.
-- Launch from the application menu.
-- Open a PDF through the file manager's `Open With` flow.
-- Drag a PDF from the file manager onto the window.
-- Confirm native Wayland operation.
-- Confirm resize, fullscreen, focus, and keyboard behavior under Hyprland.
-- Confirm the UI remains readable in both light and dark system appearances.
-- Confirm no Omarchy or Hyprland configuration was changed.
-
-### Performance checks
-
-- Page navigation should feel immediate after a neighboring page is cached.
-- The window must remain responsive while rendering a complex page.
-- Repeated navigation should not cause unbounded memory growth.
-- Fit-mode resize should settle on one sharp render rather than a cascade of stale renders.
+- `A` and the button both enter and cancel placement mode.
+- `Esc` cancels placement, then closes an editor, then leaves fullscreen in the appropriate context.
+- Clicking page center and all four edges places reachable markers at the intended positions.
+- Clicking the gray area outside the page does not place a marker.
+- A new marker appears immediately and its note field receives focus.
+- Empty, multiline, and Unicode notes save and reopen correctly.
+- Existing marker clicks never create extra annotations.
+- Markers remain aligned through fit mode, several manual zoom levels, scrolling, resize, and fullscreen.
+- Annotations are correct across multiple pages and multiple PDFs.
+- Closing and reopening the app restores all markers and notes.
+- Deletion asks for confirmation, removes only the chosen marker, and preserves numbering gaps.
+- Text entry does not trigger `A`, page navigation, or other single-key reader shortcuts.
+- Mouse, keyboard focus traversal, accessible labels, light theme, and dark theme remain usable.
+- A simulated unwritable annotation store reports failure without showing unsaved state.
+- The source PDF's contents and modification time do not change.
 
 ## 12. Definition of Done
 
-The MVP is complete when:
+The feature is complete when:
 
-- A user can install it without root access and find it in the Omarchy application launcher.
-- It opens ordinary local PDFs through the app, command line, drag and drop, and `Open With`.
-- It presents a clean one-page reading view with working navigation, page entry, zoom, fit, and fullscreen.
-- It restores the last page of recent documents after restarting.
-- Invalid, missing, large, and protected files fail safely with understandable messages.
-- It stays responsive during normal navigation and does not exhibit obvious memory growth.
-- Core state and sizing logic passes automated tests.
-- Manual checks pass on this Wayland/Hyprland desktop.
-- No file leaves the computer, no network service is started, and no Omarchy/Hyprland configuration is modified.
+- A reader can place a numbered red marker with `A` or the annotation button followed by a page click.
+- A reader can optionally add, reopen, edit, and delete notes.
+- Numbers are stable, document-scoped, and monotonically increasing.
+- Marker positions remain correct across navigation, zoom, resize, scrolling, restart, and fullscreen.
+- Annotations persist locally and independently of the bounded recent-book list.
+- Malformed storage and write failures are handled without crashing or falsely displaying unsaved changes.
+- Annotation controls and markers are keyboard accessible and screen-reader labeled.
+- Existing reader behavior and tests still pass.
+- The PDF is never modified and no annotation data leaves the computer.
 
-## 13. Possible Follow-ups After the MVP
+## 13. Assumptions to Confirm Before Implementation
 
-Only consider these after real use shows they are valuable:
+This plan uses the following defaults, which can be changed before implementation:
 
-- Text search.
-- Outline/table-of-contents navigation.
-- User bookmarks.
-- Optional two-page spread.
-- Sepia/background reading themes.
-- Password entry for protected PDFs.
-- Thumbnail sidebar.
-- Packaging as an Arch package or Flatpak.
-- EPUB support through a separate document backend.
-
+1. Annotation numbering is per document, spans all pages, never renumbers, and does not reuse deleted numbers.
+2. Clicking a marker opens an anchored popover rather than a permanent sidebar.
+3. An empty note still leaves a valid numbered annotation.
+4. Annotations persist across restarts in local application state but are not embedded in the PDF or exported.
+5. A PDF whose size or modification time changes is treated as a new document, so old annotations are retained in storage but hidden from the changed file.
+6. Placement mode creates one annotation and then turns itself off.
