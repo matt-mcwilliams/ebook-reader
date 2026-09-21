@@ -439,8 +439,8 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._show_state("loading")
 
         # Let GTK paint the loading state before Poppler does synchronous file
-        # parsing and page rendering. Threading is intentionally deferred until
-        # it is needed by a later performance-focused phase.
+        # parsing. Page rendering itself is dispatched to the serialized worker
+        # once the document has loaded.
         GLib.idle_add(self._load_file, path, generation)
 
     def _load_file(self, path: str, generation: int) -> bool:

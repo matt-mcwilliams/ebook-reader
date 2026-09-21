@@ -1,7 +1,9 @@
 # PDF Ebook Reader
 
-A small native GTK 4 PDF reader for Linux. Phase 3 provides local PDF opening,
-page navigation, fit/manual zoom, scrolling, fullscreen, and drag-and-drop opening.
+A small native GTK 4 PDF reader for Linux. Phase 4 provides local PDF opening,
+page navigation, fit/manual zoom, scrolling, fullscreen, drag-and-drop opening,
+recent-book persistence, reading-position restoration, and bounded background
+rendering.
 
 ## Requirements
 
@@ -47,6 +49,12 @@ shortcuts include `Left`/`Right`, `Page Up`/`Page Down`, `Space`, `Home`, and
 `End`; `Ctrl+0` fits the page, `Ctrl++`/`Ctrl+-` adjust zoom, `F11` toggles
 fullscreen, and `Ctrl+O` opens another PDF. Hold `Ctrl` while using the mouse
 wheel to change zoom. A PDF can also be dropped onto the window.
+
+The reader stores a small amount of per-user state in
+`~/.local/state/pdf-ebook-reader/state.json` (or `$XDG_STATE_HOME`): recent
+absolute paths, matching file metadata, the last page and zoom mode, and the
+last non-fullscreen window size. PDFs remain in their original locations and
+are never copied or uploaded.
 
 ## Install as a Python project
 

@@ -118,6 +118,8 @@ class RenderCache:
 def clamp_manual_scale(scale: float) -> float:
     """Keep a user-selected zoom level inside the supported range."""
 
+    if not math.isfinite(scale):
+        return DEFAULT_SCALE
     return min(MAX_MANUAL_SCALE, max(MIN_MANUAL_SCALE, scale))
 
 
