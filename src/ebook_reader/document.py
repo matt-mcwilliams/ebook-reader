@@ -56,7 +56,7 @@ def _has_pdf_content_type(path: Path) -> bool:
 
 
 class PdfDocument:
-    """A successfully opened local PDF and the small API Phase 2 needs."""
+    """A successfully opened local PDF and the reader's document API."""
 
     def __init__(self, *, path: Path, document: Poppler.Document) -> None:
         self.path = path

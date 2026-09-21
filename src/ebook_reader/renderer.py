@@ -14,6 +14,9 @@ from gi.repository import Gdk, GLib, Poppler  # noqa: E402
 
 
 DEFAULT_SCALE = 1.0
+MIN_MANUAL_SCALE = 0.5
+MAX_MANUAL_SCALE = 3.0
+ZOOM_STEP = 1.25
 MAX_RENDER_DIMENSION = 4096
 MAX_RENDER_PIXELS = 16_000_000
 
@@ -25,6 +28,28 @@ class RenderedPage:
     texture: Gdk.Texture
     width: int
     height: int
+
+
+def clamp_manual_scale(scale: float) -> float:
+    """Keep a user-selected zoom level inside the supported range."""
+
+    return min(MAX_MANUAL_SCALE, max(MIN_MANUAL_SCALE, scale))
+
+
+def fit_scale_for_viewport(
+    page_width: float,
+    page_height: float,
+    viewport_width: float,
+    viewport_height: float,
+) -> float:
+    """Return the largest aspect-preserving scale that fits the viewport."""
+
+    if page_width <= 0 or page_height <= 0:
+        raise ValueError("PDF page has invalid dimensions")
+    if viewport_width <= 0 or viewport_height <= 0:
+        raise ValueError("Viewport dimensions must be positive")
+
+    return min(viewport_width / page_width, viewport_height / page_height)
 
 
 def _render_dimensions(width: float, height: float, scale: float) -> tuple[int, int]:
