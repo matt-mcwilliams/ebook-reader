@@ -447,6 +447,403 @@ class ReaderWindow(Gtk.ApplicationWindow):
     def _set_accessible_label(widget: Gtk.Widget, label: str) -> None:
         widget.update_property([Gtk.AccessibleProperty.LABEL], [label])
 
+    def _draw_selection_highlight(
+        self,
+        area: Gtk.DrawingArea,
+        context: object,
+        _width: int,
+        _height: int,
+    ) -> None:
+        """Paint Poppler's glyph-aligned rectangles above the page raster."""
+
+        if not self._selection_highlights:
+            return
+        color = area.get_color()
+        context.save()  # type: ignore[attr-defined]
+        context.set_source_rgba(color.red, color.green, color.blue, 0.30)  # type: ignore[attr-defined]
+        for rectangle in self._selection_highlights:
+            context.rectangle(
+                round(rectangle.x),
+                round(rectangle.y),
+                round(rectangle.width),
+                round(rectangle.height),
+            )  # type: ignore[attr-defined]
+        context.fill()  # type: ignore[attr-defined]
+        context.restore()  # type: ignore[attr-defined]
+
+    def _update_page_cursor(self) -> None:
+        if not hasattr(self, "_page_fixed"):
+            return
+        cursor_name: str | None = None
+        if self._document is not None and self._page_width > 0 and self._page_height > 0:
+            cursor_name = "crosshair" if self._annotation_mode else "text"
+        try:
+            self._page_fixed.set_cursor(
+                Gdk.Cursor.new_from_name(cursor_name, None) if cursor_name else None
+            )
+        except (TypeError, GLib.Error):  # pragma: no cover - GTK version dependent
+            self._page_fixed.set_cursor(None)
+
+    def _on_page_click_pressed(
+        self,
+        _gesture: Gtk.GestureClick,
+        _n_press: int,
+        _x: float,
+        _y: float,
+    ) -> None:
+        # The drag controller marks the sequence as claimed once GTK's drag
+        # threshold is crossed.  Reset the marker at the start of every new
+        # primary sequence so a completed drag cannot affect the next click.
+        self._selection_drag_claimed = False
+
+    def _on_selection_drag_begin(
+        self,
+        gesture: Gtk.GestureDrag,
+        x: float,
+        y: float,
+    ) -> None:
+        if (
+            self._document is None
+            or self._annotation_mode
+            or self._focus_is_text_input()
+            or self._page_width <= 0
+            or self._page_height <= 0
+            or self._displayed_page is None
+            or self._displayed_source_width <= 0
+            or self._displayed_source_height <= 0
+            or self._point_hits_marker(x, y)
+        ):
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
+
+        try:
+            anchor = clamp_render_point(x, y, self._page_width, self._page_height)
+        except ValueError:
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
+
+        self._clear_text_selection()
+        self._selection_drag_anchor = anchor
+        self._selection_drag_current = anchor
+        self._selection_drag_active = True
+        self._selection_drag_claimed = True
+        self._selection_region_deferred = False
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self._update_selection_for_pointer(anchor)
+
+    def _on_selection_drag_update(
+        self,
+        gesture: Gtk.GestureDrag,
+        offset_x: float,
+        offset_y: float,
+    ) -> None:
+        if not self._selection_drag_active or self._selection_drag_anchor is None:
+            return
+        try:
+            current = clamp_render_point(
+                self._selection_drag_anchor.x + offset_x,
+                self._selection_drag_anchor.y + offset_y,
+                self._page_width,
+                self._page_height,
+            )
+        except ValueError:
+            return
+        self._update_selection_for_pointer(current)
+        self._schedule_selection_autoscroll(current)
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _on_selection_drag_end(
+        self,
+        _gesture: Gtk.GestureDrag,
+        offset_x: float,
+        offset_y: float,
+    ) -> None:
+        if not self._selection_drag_active or self._selection_drag_anchor is None:
+            return
+
+        try:
+            current = clamp_render_point(
+                self._selection_drag_anchor.x + offset_x,
+                self._selection_drag_anchor.y + offset_y,
+                self._page_width,
+                self._page_height,
+            )
+        except ValueError:
+            current = self._selection_drag_current
+
+        self._selection_drag_active = False
+        self._cancel_pending_selection_update()
+        self._cancel_selection_autoscroll()
+        if current is None:
+            self._clear_text_selection()
+            return
+        self._update_selection_for_pointer(current, queue_update=False)
+        self._selection_region_deferred = False
+        self._refresh_selection_highlight()
+
+        selection = self._text_selection
+        page = self._displayed_page
+        if selection is None or page is None:
+            self._clear_text_selection()
+            return
+        text = selected_text(page, selection.rectangle)
+        if not text.strip():
+            self._clear_text_selection()
+            return
+        self._selected_text = text
+        self._text_selection = selection.with_text(text)
+
+    def _update_selection_for_pointer(
+        self,
+        current: RenderPoint,
+        *,
+        queue_update: bool = True,
+    ) -> None:
+        anchor = self._selection_drag_anchor
+        if anchor is None or self._displayed_source_width <= 0 or self._displayed_source_height <= 0:
+            return
+        if self._selection_drag_current == current and self._text_selection is not None:
+            return
+        try:
+            selection = selection_from_render_points(
+                self._current_page,
+                anchor,
+                current,
+                self._page_width,
+                self._page_height,
+                self._displayed_source_width,
+                self._displayed_source_height,
+            )
+        except ValueError:
+            return
+        self._selection_drag_current = current
+        self._text_selection = selection
+        self._selected_text = ""
+        if queue_update:
+            self._queue_selection_region_update()
+
+    def _queue_selection_region_update(self) -> None:
+        if self._selection_region_deferred or self._selection_update_idle_id is not None:
+            return
+        self._selection_update_idle_id = GLib.idle_add(self._run_selection_region_update)
+
+    def _run_selection_region_update(self) -> bool:
+        self._selection_update_idle_id = None
+        if self._selection_drag_active:
+            self._refresh_selection_highlight()
+        return GLib.SOURCE_REMOVE
+
+    def _refresh_selection_highlight(self) -> None:
+        selection = self._text_selection
+        if (
+            selection is None
+            or self._displayed_page is None
+            or self._displayed_page_document is not self._document
+            or self._displayed_page_index != self._current_page
+            or self._displayed_render_generation != self._render_generation
+        ):
+            self._selection_highlights = ()
+            self._selection_overlay.queue_draw()
+            return
+        self._selection_highlights = selection_region(
+            self._displayed_page,
+            selection.rectangle,
+            (self._page_width, self._page_height),
+            max_rectangles=MAX_SELECTION_RECTANGLES,
+        )
+        self._selection_overlay.queue_draw()
+
+    def _schedule_selection_autoscroll(self, current: RenderPoint) -> None:
+        adjustment_x = self._reader_scrolled.get_hadjustment()
+        adjustment_y = self._reader_scrolled.get_vadjustment()
+        self._selection_pointer_viewport = (
+            current.x - adjustment_x.get_value(),
+            current.y - adjustment_y.get_value(),
+        )
+        if self._selection_autoscroll_timeout_id is None:
+            self._selection_autoscroll_timeout_id = GLib.timeout_add(
+                30,
+                self._on_selection_autoscroll,
+            )
+
+    def _on_selection_autoscroll(self) -> bool:
+        if not self._selection_drag_active or self._selection_pointer_viewport is None:
+            self._selection_autoscroll_timeout_id = None
+            return GLib.SOURCE_REMOVE
+
+        pointer_x, pointer_y = self._selection_pointer_viewport
+        adjustment_x = self._reader_scrolled.get_hadjustment()
+        adjustment_y = self._reader_scrolled.get_vadjustment()
+        viewport_width = max(1, self._reader_scrolled.get_width())
+        viewport_height = max(1, self._reader_scrolled.get_height())
+        edge = 32.0
+        step = 24.0
+        old_x = adjustment_x.get_value()
+        old_y = adjustment_y.get_value()
+        new_x = old_x
+        new_y = old_y
+        if pointer_x < edge:
+            new_x = max(adjustment_x.get_lower(), old_x - step)
+        elif pointer_x > viewport_width - edge:
+            new_x = min(adjustment_x.get_upper() - adjustment_x.get_page_size(), old_x + step)
+        if pointer_y < edge:
+            new_y = max(adjustment_y.get_lower(), old_y - step)
+        elif pointer_y > viewport_height - edge:
+            new_y = min(adjustment_y.get_upper() - adjustment_y.get_page_size(), old_y + step)
+        delta_x = new_x - old_x
+        delta_y = new_y - old_y
+        if delta_x or delta_y:
+            adjustment_x.set_value(new_x)
+            adjustment_y.set_value(new_y)
+            if self._selection_drag_current is not None:
+                try:
+                    current = clamp_render_point(
+                        self._selection_drag_current.x + delta_x,
+                        self._selection_drag_current.y + delta_y,
+                        self._page_width,
+                        self._page_height,
+                    )
+                except ValueError:
+                    current = self._selection_drag_current
+                self._update_selection_for_pointer(current)
+        return GLib.SOURCE_CONTINUE
+
+    def _cancel_pending_selection_update(self) -> None:
+        if self._selection_update_idle_id is not None:
+            GLib.source_remove(self._selection_update_idle_id)
+            self._selection_update_idle_id = None
+
+    def _cancel_selection_autoscroll(self) -> None:
+        if self._selection_autoscroll_timeout_id is not None:
+            GLib.source_remove(self._selection_autoscroll_timeout_id)
+            self._selection_autoscroll_timeout_id = None
+        self._selection_pointer_viewport = None
+
+    def _clear_text_selection(self) -> None:
+        """Clear all transient PDF selection state in one place."""
+
+        self._cancel_pending_selection_update()
+        self._cancel_selection_autoscroll()
+        self._close_selection_context()
+        self._selection_drag_anchor = None
+        self._selection_drag_current = None
+        self._selection_drag_active = False
+        self._selection_drag_claimed = False
+        self._text_selection = None
+        self._selected_text = ""
+        self._selection_highlights = ()
+        self._selection_region_deferred = False
+        if hasattr(self, "_selection_overlay"):
+            self._selection_overlay.queue_draw()
+
+    def _point_in_selection(self, x: float, y: float) -> bool:
+        return any(
+            rectangle.x <= x <= rectangle.x + rectangle.width
+            and rectangle.y <= y <= rectangle.y + rectangle.height
+            for rectangle in self._selection_highlights
+        )
+
+    def _on_selection_context_released(
+        self,
+        gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+    ) -> None:
+        if self._annotation_mode or self._point_hits_marker(x, y):
+            gesture.set_state(Gtk.EventSequenceState.DENIED)
+            return
+        if not self._selected_text or not self._point_in_selection(x, y):
+            self._clear_text_selection()
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            return
+        self._open_selection_context(x, y)
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    def _open_selection_context(self, x: float, y: float) -> None:
+        self._close_selection_context()
+        popover = Gtk.Popover()
+        popover.set_autohide(True)
+        popover.set_position(Gtk.PositionType.BOTTOM)
+        popover.connect("closed", self._on_selection_context_closed)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        content.set_margin_start(4)
+        content.set_margin_end(4)
+        content.set_margin_top(4)
+        content.set_margin_bottom(4)
+        copy_button = Gtk.Button(label="Copy")
+        self._set_accessible_label(copy_button, "Copy selected text")
+        copy_button.connect("clicked", self._on_selection_context_copy)
+        clear_button = Gtk.Button(label="Clear Selection")
+        self._set_accessible_label(clear_button, "Clear PDF text selection")
+        clear_button.connect("clicked", self._on_selection_context_clear)
+        content.append(copy_button)
+        content.append(clear_button)
+        popover.set_child(content)
+        popover.set_parent(self._page_fixed)
+        pointing_to = Gdk.Rectangle()
+        pointing_to.x = int(round(x))
+        pointing_to.y = int(round(y))
+        pointing_to.width = 1
+        pointing_to.height = 1
+        popover.set_pointing_to(pointing_to)
+        self._selection_context_popover = popover
+        popover.popup()
+        GLib.idle_add(self._focus_selection_context_copy, copy_button)
+
+    def _focus_selection_context_copy(self, button: Gtk.Button) -> bool:
+        if self._selection_context_popover is not None:
+            button.grab_focus()
+        return GLib.SOURCE_REMOVE
+
+    def _on_selection_context_copy(self, _button: Gtk.Button) -> None:
+        self._copy_selected_text()
+        self._close_selection_context()
+
+    def _on_selection_context_clear(self, _button: Gtk.Button) -> None:
+        self._clear_text_selection()
+
+    def _close_selection_context(self) -> None:
+        popover = self._selection_context_popover
+        if popover is None:
+            return
+        self._selection_context_popover = None
+        popover.popdown()
+        popover.set_child(None)
+        if popover.get_parent() is not None:
+            popover.unparent()
+
+    def _on_selection_context_closed(self, popover: Gtk.Popover) -> None:
+        if self._selection_context_popover is not popover:
+            return
+        self._selection_context_popover = None
+        popover.set_child(None)
+        if popover.get_parent() is not None:
+            popover.unparent()
+
+    def _copy_selected_text(self) -> bool:
+        if not self._selected_text or not self._selected_text.strip():
+            return False
+        display = Gdk.Display.get_default()
+        if display is None:
+            self._show_reader_feedback("Could not access the clipboard")
+            return False
+        try:
+            provider = Gdk.ContentProvider.new_for_value(self._selected_text)
+            if not display.get_clipboard().set_content(provider):
+                raise RuntimeError("The clipboard rejected the selected text")
+            self._selection_clipboard_provider = provider
+        except (GLib.Error, TypeError, ValueError, RuntimeError) as error:
+            print(f"Unable to copy selected PDF text: {error}", file=sys.stderr)
+            self._show_reader_feedback("Could not copy selected text")
+            return False
+        self._show_reader_feedback("Copied selected text")
+        return True
+
+    def _show_reader_feedback(self, message: str) -> None:
+        self._show_annotation_feedback(message)
+
     def _on_annotate_toggled(self, button: Gtk.ToggleButton) -> None:
         self._set_annotation_mode(button.get_active())
 
@@ -458,6 +855,8 @@ class ReaderWindow(Gtk.ApplicationWindow):
         if active and self._annotation_editor is not None:
             if not self._close_annotation_editor(save=True):
                 active = False
+        if active:
+            self._clear_text_selection()
 
         self._annotation_mode = active
         if self._annotate_button.get_active() != active:
@@ -472,7 +871,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 self._page_fixed.set_cursor(None)
         else:
             self._annotation_prompt.set_visible(False)
-            self._page_fixed.set_cursor(None)
+        self._update_page_cursor()
         return active
 
     def _update_annotation_prompt(self) -> None:
@@ -492,23 +891,31 @@ class ReaderWindow(Gtk.ApplicationWindow):
     ) -> None:
         """Create an annotation only for a click inside the rendered page."""
 
-        if not self._annotation_mode or self._document is None:
+        if self._annotation_mode:
+            if self._document is None:
+                return
+            if self._point_hits_marker(x, y):
+                return
+            if not 0 <= x <= self._page_width or not 0 <= y <= self._page_height:
+                return
+            try:
+                normalized_x, normalized_y = pixels_to_normalized(
+                    x,
+                    y,
+                    self._page_width,
+                    self._page_height,
+                )
+            except ValueError:
+                return
+            self._place_annotation(normalized_x, normalized_y)
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+            return
+        if self._selection_drag_claimed:
+            self._selection_drag_claimed = False
             return
         if self._point_hits_marker(x, y):
             return
-        if not 0 <= x <= self._page_width or not 0 <= y <= self._page_height:
-            return
-        try:
-            normalized_x, normalized_y = pixels_to_normalized(
-                x,
-                y,
-                self._page_width,
-                self._page_height,
-            )
-        except ValueError:
-            return
-        self._place_annotation(normalized_x, normalized_y)
-        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        self._clear_text_selection()
 
     def _place_annotation(self, x: float, y: float) -> None:
         document = self._document
