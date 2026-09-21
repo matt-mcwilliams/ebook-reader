@@ -32,6 +32,16 @@ from .renderer import (
     render_page,
 )
 from .settings import SettingsStore
+from .text_selection import (
+    HighlightRectangle,
+    MAX_SELECTION_RECTANGLES,
+    RenderPoint,
+    TextSelection,
+    clamp_render_point,
+    selected_text,
+    selection_from_render_points,
+    selection_region,
+)
 
 
 APPLICATION_TITLE = "PDF Ebook Reader"
@@ -111,6 +121,25 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._annotation_confirmation: Gtk.Popover | None = None
         self._annotation_closing_editor = False
         self._annotation_feedback_timeout_id: int | None = None
+        self._selection_drag_anchor: RenderPoint | None = None
+        self._selection_drag_current: RenderPoint | None = None
+        self._selection_drag_active = False
+        self._selection_drag_claimed = False
+        self._selection_pointer_viewport: tuple[float, float] | None = None
+        self._selection_autoscroll_timeout_id: int | None = None
+        self._text_selection: TextSelection | None = None
+        self._selected_text = ""
+        self._selection_highlights: tuple[HighlightRectangle, ...] = ()
+        self._selection_update_idle_id: int | None = None
+        self._selection_region_deferred = False
+        self._selection_context_popover: Gtk.Popover | None = None
+        self._selection_clipboard_provider: Gdk.ContentProvider | None = None
+        self._displayed_page: object | None = None
+        self._displayed_page_document: PdfDocument | None = None
+        self._displayed_page_index: int | None = None
+        self._displayed_render_generation: int | None = None
+        self._displayed_source_width = 0.0
+        self._displayed_source_height = 0.0
 
         self._title_label = Gtk.Label(label=APPLICATION_TITLE)
         self._title_label.set_max_width_chars(48)
@@ -179,8 +208,12 @@ class ReaderWindow(Gtk.ApplicationWindow):
             .annotation-mode-button:checked {
                 background: alpha(@accent_bg_color, 0.35);
             }
+            .selection-highlight {
+                color: @accent_bg_color;
+            }
             .annotation-prompt,
-            .annotation-feedback {
+            .annotation-feedback,
+            .reader-feedback {
                 background: alpha(@theme_bg_color, 0.94);
                 border-radius: 8px;
                 padding: 8px 12px;
@@ -250,10 +283,31 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._page_fixed.set_valign(Gtk.Align.CENTER)
         self._page_fixed.set_can_target(True)
         self._page_fixed.put(self._page_picture, 0, 0)
+
+        self._selection_overlay = Gtk.DrawingArea()
+        self._selection_overlay.add_css_class("selection-highlight")
+        self._selection_overlay.set_can_target(False)
+        self._selection_overlay.set_draw_func(self._draw_selection_highlight)
+        self._page_fixed.put(self._selection_overlay, 0, 0)
+
         page_click = Gtk.GestureClick()
         page_click.set_button(Gdk.BUTTON_PRIMARY)
+        page_click.connect("pressed", self._on_page_click_pressed)
         page_click.connect("released", self._on_page_click_released)
         self._page_fixed.add_controller(page_click)
+
+        page_drag = Gtk.GestureDrag()
+        page_drag.set_button(Gdk.BUTTON_PRIMARY)
+        page_drag.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        page_drag.connect("drag-begin", self._on_selection_drag_begin)
+        page_drag.connect("drag-update", self._on_selection_drag_update)
+        page_drag.connect("drag-end", self._on_selection_drag_end)
+        self._page_fixed.add_controller(page_drag)
+
+        context_click = Gtk.GestureClick()
+        context_click.set_button(Gdk.BUTTON_SECONDARY)
+        context_click.connect("released", self._on_selection_context_released)
+        self._page_fixed.add_controller(context_click)
 
         self._page_frame = Gtk.Frame()
         self._page_frame.add_css_class("reader-page")
