@@ -1056,6 +1056,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
         note_view.set_hexpand(True)
         self._set_accessible_label(note_view, f"Notes for annotation {annotation.number}")
         note_view.get_buffer().set_text(annotation.note)
+        note_key_controller = Gtk.EventControllerKey()
+        note_key_controller.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        note_key_controller.connect("key-pressed", self._on_annotation_note_key_pressed)
+        note_view.add_controller(note_key_controller)
         note_scroll = Gtk.ScrolledWindow()
         note_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         note_scroll.set_child(note_view)
@@ -1089,6 +1093,20 @@ class ReaderWindow(Gtk.ApplicationWindow):
         if self._annotation_editor is popover and self._annotation_note_view is not None:
             self._annotation_note_view.grab_focus()
         return GLib.SOURCE_REMOVE
+
+    def _on_annotation_note_key_pressed(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+    ) -> bool:
+        if not state & Gdk.ModifierType.CONTROL_MASK:
+            return False
+        if keyval not in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            return False
+        self._close_annotation_editor(save=True)
+        return True
 
     def _on_annotation_popover_closed(self, popover: Gtk.Popover) -> None:
         if self._annotation_closing_editor or self._annotation_editor is not popover:
@@ -1806,20 +1824,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 return True
             return False
 
-        control = bool(state & Gdk.ModifierType.CONTROL_MASK)
-        if (
-            control
-            and keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
-            and self._annotation_editor is not None
-            and self._annotation_note_view is not None
-            and self.get_focus() is self._annotation_note_view
-        ):
-            self._close_annotation_editor(save=True)
-            return True
-
         if self._annotation_editor is not None or self._focus_is_text_input():
             return False
 
+        control = bool(state & Gdk.ModifierType.CONTROL_MASK)
         if control and keyval in (Gdk.KEY_c, Gdk.KEY_C) and self._selected_text:
             self._copy_selected_text()
             return True
