@@ -30,7 +30,7 @@ class _Region:
     def __init__(self, *rectangles: _RegionRectangle) -> None:
         self._rectangles = rectangles
 
-    def get_num_rectangles(self) -> int:
+    def num_rectangles(self) -> int:
         return len(self._rectangles)
 
     def get_rectangle(self, index: int) -> _RegionRectangle:

@@ -280,6 +280,16 @@ def _region_rectangle(region: Any, index: int) -> tuple[float, float, float, flo
     return float(value.x), float(value.y), float(value.width), float(value.height)
 
 
+def _region_rectangle_count(region: Any) -> int:
+    """Read the rectangle count across Pycairo and introspection bindings."""
+
+    for method_name in ("num_rectangles", "get_num_rectangles"):
+        method = getattr(region, method_name, None)
+        if callable(method):
+            return int(method())
+    raise AttributeError("Poppler returned a region without a rectangle count")
+
+
 def selection_region(
     page: Any,
     rectangle: SelectionRectangle,
@@ -313,7 +323,7 @@ def selection_region(
         )
         if region is None:
             return ()
-        count = int(region.get_num_rectangles())
+        count = _region_rectangle_count(region)
         if count < 0:
             raise ValueError("Poppler returned a negative region size")
         if count > max_rectangles:
