@@ -1,309 +1,351 @@
-# PDF Ebook Reader - Cursor Text Selection Plan
+# Reader State Machine Refactor Plan
 
 ## 1. Goal
 
-Add native-feeling mouse text selection to the currently displayed PDF page.
+Refactor the reader so an explicit state machine owns its interaction mode. The
+application has two states:
 
-A reader should be able to:
+- `VIEW` is the default and preserves the current reading, page navigation,
+  zoom, text-selection, and annotation-marker behavior.
+- `ANNOTATE` makes annotation review and placement the primary interaction.
 
-- Move the pointer over selectable page content and see an I-beam cursor.
-- Press and drag from a start point to an end point to select PDF text.
-- See a translucent highlight that follows the drag and matches Poppler's text layout.
-- Copy the selected text with `Ctrl+C` or a context-menu `Copy` action.
-- Click elsewhere, press `Esc`, navigate, or open another document to clear the selection.
+Pressing unmodified `V` enters `VIEW`; pressing unmodified `A` enters
+`ANNOTATE`. These keys select a state rather than toggling it. After a new
+annotation is successfully placed, the reader returns to `VIEW`.
 
-Selection is transient UI state. It does not modify the PDF and is not stored between pages or application sessions.
+The bottom strip is state-dependent. In `VIEW` it shows the current page and
+page count as it does today. In `ANNOTATE` it shows the active annotation's
+ordinal and the document's annotation count, for example `Annotation 5 of 15`,
+instead of page numbers.
 
 ## 2. Product Decisions and Boundaries
 
-### Planned behavior
+### State behavior
 
-- Selection is enabled by default whenever a PDF page is displayed and annotation placement mode is off.
-- A primary-button drag selects text on the current page using Poppler's glyph-level selection semantics.
-- Drag direction is preserved. The pointer-down position is the selection start and the current/release position is the selection end.
-- Drag points are clamped to the rendered page and converted to PDF page coordinates before calling Poppler.
-- The highlight updates while dragging, then remains visible after release if Poppler returns non-empty text.
-- `Ctrl+C` copies the selected text to the standard desktop clipboard.
-- Right-clicking a non-empty selection opens a small menu with `Copy` and `Clear Selection`.
-- Starting a new drag replaces the old selection. A normal primary click outside an annotation marker clears it.
-- Selection is limited to one page because the reader displays one page at a time.
-- Existing numbered annotation markers remain clickable above the selection highlight.
-- Entering annotation placement mode clears the selection and temporarily gives the page click/drag gesture to annotation placement.
+- A newly opened document starts in `VIEW`. Reader mode is transient and is
+  not restored between launches or documents.
+- Re-entering the current state is idempotent: `V` in `VIEW` and `A` in
+  `ANNOTATE` do not toggle or reset the state.
+- The existing `Annotate` button becomes a mode selector that enters
+  `ANNOTATE`; add a corresponding `View` selector so the mouse UI exposes the
+  same two transitions as `V` and `A`.
+- The two mode controls are mutually exclusive and always reflect the state
+  machine. They must not maintain a second source of truth through independent
+  toggle callbacks.
+- `Esc` returns from `ANNOTATE` to `VIEW`, after preserving the existing higher
+  priority for closing an annotation editor and clearing a text selection.
+- Opening another document, entering an error/empty state, and closing the
+  window transition to `VIEW` through the same state-machine API.
 
-### Not included in this feature
+### Annotation sequence
 
-- OCR for scanned or image-only PDFs.
-- Cross-page selection.
-- Keyboard caret navigation, Shift+Arrow selection, or a persistent selectable text widget.
-- Double-click word selection or triple-click line/paragraph selection in the first version.
-- Search, highlighting saved as an annotation, comments attached to selected text, or selection persistence.
-- Rich-text, HTML, image, or layout-preserving clipboard formats.
-- Changing Poppler's reading order or repairing malformed/missing PDF text maps.
+- Annotation position in the bottom counter is a one-based ordinal in the
+  document's current annotations sorted by their stable display `number`.
+  It is not the annotation's display number: after deletions, annotation 7 may
+  be shown as `Annotation 5 of 15`.
+- Entering `ANNOTATE` selects the first annotation on the current page. If that
+  page has none, select the first annotation on a later page; wrap to the first
+  document annotation when necessary.
+- Re-entering `ANNOTATE` without leaving it preserves the active annotation.
+- If the document has no annotations, the strip reads `No annotations`; the
+  user can still click the page to create the first one.
+- Previous/next controls in `ANNOTATE` move through the document-wide
+  annotation sequence, changing pages when needed and visually identifying
+  the active marker. They do not open the note editor automatically.
+- Clicking a marker makes it the active annotation before opening its existing
+  editor. Deleting the active annotation selects its next neighbor, or the
+  previous neighbor when the deleted item was last.
+- Adding, deleting, loading, or otherwise refreshing annotations rebuilds the
+  sequence by ID so stale indices never point at a different annotation.
 
-## 3. User Experience
+### Existing behavior retained
 
-### Starting and extending a selection
+- In `VIEW`, Previous/Next, the editable page field, page counts, keyboard page
+  navigation, zoom, fullscreen, text selection, copying, and marker editing
+  continue to work as they do now.
+- Annotation markers remain visible and editable in both states.
+- `ANNOTATE` keeps the existing crosshair, placement prompt, marker hit
+  protection, normalized coordinate storage, save rollback, and note editor.
+- Text selection is unavailable in `ANNOTATE`; entering it clears any current
+  selection and closes its context menu.
+- Placing an annotation still opens the note editor, but only after the mode
+  transition to `VIEW` succeeds. If creation or persistence fails, remain in
+  `ANNOTATE` so the placement can be retried.
+- Zooming and rerendering do not change the reader state or active annotation.
 
-When a rendered page is ready and annotation mode is inactive, the page uses an I-beam cursor. On primary-button press:
+### Not included
 
-1. Close an open annotation editor only if its current contents can be saved.
-2. Ignore the gesture if it began on an annotation marker.
-3. Clear the previous selection and record the clamped pointer position as the anchor.
-4. As the pointer moves, convert the anchor and current point into a directional Poppler selection rectangle.
-5. Ask Poppler for the selected region and repaint the translucent highlight.
-6. Auto-scroll the existing `Gtk.ScrolledWindow` when the pointer is near a viewport edge, while keeping coordinates relative to the page.
+- More than the two top-level states, nested/history states, or persistence of
+  the current state.
+- Changing the annotation JSON schema, numbering policy, or source-PDF data.
+- Reordering annotations manually, filtering annotations by page, or adding a
+  separate annotations sidebar/list.
+- Automatically opening every annotation while traversing the sequence.
+- Undo/redo for annotation creation, editing, or deletion.
 
-Do not commit a selection until the drag exceeds GTK's drag threshold. This keeps a simple click available for clearing the current selection and prevents tiny accidental highlights.
+## 3. State Machine Design
 
-On release, ask Poppler for the selected text using the same rectangle and `Poppler.SelectionStyle.GLYPH`. If the result is empty or whitespace-only, clear the selection. Otherwise, retain both the rectangle and exact returned text.
+Add a small UI-independent module, for example `reader_state.py`, containing:
 
-### Visual feedback
+- `ReaderMode(Enum)` with `VIEW` and `ANNOTATE`.
+- A transition/event representation for `ENTER_VIEW`, `ENTER_ANNOTATE`,
+  `DOCUMENT_CLEARED`, and `ANNOTATION_PLACED` (or equivalently named typed
+  methods on a controller).
+- A pure transition function that receives the current mode and event and
+  returns the next mode. Unsupported events should fail in tests rather than
+  silently create a third behavior path.
+- Pure annotation-sequence helpers that order annotations, resolve an active
+  annotation ID, calculate its ordinal/count, and choose a neighbor after
+  deletion.
 
-- Draw selection regions with the theme accent color at roughly 30% opacity so black text stays legible.
-- Draw the highlight above the rasterized PDF and below annotation marker buttons.
-- Use Poppler's returned selected region rather than painting the raw drag rectangle. This makes multi-line selection follow glyph/line geometry and avoids highlighting empty margins.
-- Recompute the region after each completed page render so the same in-progress or completed selection stays aligned if zoom changes.
-- Expose a short non-modal message after copying, such as `Copied selected text`, using the existing feedback overlay generalized beyond annotation errors.
+`ReaderWindow` remains responsible for GTK side effects, but it must have only
+one mode field: `self._reader_mode`. Replace direct writes to
+`self._annotation_mode` and scattered calls to `_set_annotation_mode()` with a
+single transition gateway such as `_transition_reader(event)`.
 
-### Copying and clearing
+For each accepted transition, the gateway applies all state-related effects in
+one place:
 
-- `Ctrl+C` copies only when a non-empty PDF selection exists and focus is not inside `Gtk.Entry` or `Gtk.TextView`. Text widgets keep their normal copy behavior.
-- Use a UTF-8 string `Gdk.ContentProvider` with the display clipboard; do not create a custom clipboard format.
-- Right-click inside the selected region opens `Copy` and `Clear Selection`. Right-click outside it may clear the selection but should not show a disabled menu.
-- `Esc` clears a PDF selection after handling an annotation editor or annotation placement mode, and before leaving fullscreen.
-- A primary click without a drag clears the selection unless it activates an annotation marker.
-- Page navigation, document changes, errors, and window close clear the selection.
-- Zoom and window resize preserve the selection rectangle and redraw it at the new render dimensions.
+1. Save or close an open annotation editor when the initiating action requires
+   it; abort the transition without changing controls if saving fails.
+2. Clear transient text-selection/placement data that is invalid in the target
+   state.
+3. Update `self._reader_mode` and repair the active annotation ID.
+4. Synchronize the View/Annotate controls without recursively dispatching a
+   second transition.
+5. Update the bottom-strip model, placement prompt, cursor, marker emphasis,
+   sensitivity, and accessibility text.
 
-## 4. Selection Model and Poppler Boundary
+Mode queries in gestures and shortcut dispatch should compare against
+`ReaderMode`; no compatibility boolean should remain after migration.
 
-Add a focused `text_selection.py` module so coordinate math and selection state are testable without constructing the GTK window.
+## 4. State-Dependent Bottom Strip
 
-### Value objects
-
-Represent a selection with immutable values:
-
-- Zero-based page index.
-- Anchor point in PDF page coordinates.
-- Current/end point in PDF page coordinates.
-- Extracted text, empty while a drag is still in progress.
-
-Represent highlight rectangles in rendered-page pixel coordinates. They are derived display state and are never persisted.
-
-### Coordinate conversion
-
-Keep three coordinate spaces explicit:
-
-1. Widget/render coordinates from GTK pointer events.
-2. PDF page coordinates in points, as expected by `Poppler.Rectangle`.
-3. Highlight-region coordinates returned by Poppler at a requested pixels-per-point scale.
-
-Conversion helpers should:
-
-- Reject non-finite or non-positive page dimensions.
-- Clamp pointer input to the inclusive rendered page bounds.
-- Calculate independent X and Y ratios from the actual `RenderedPage.width`/`height` and `Poppler.Page.get_size()` results.
-- Preserve anchor/end ordering when creating the Poppler rectangle instead of sorting its corners; Poppler documents the rectangle as the selection's start and end points.
-- Use a representative pixels-per-point scale for `get_selected_region()` and compensate for any tiny X/Y difference introduced by integer render dimensions.
-- Round only when producing Cairo drawing rectangles, not when retaining the PDF-space selection.
-
-### Poppler adapter
-
-Wrap page selection calls in narrow helpers:
-
-- `selection_region(page, rectangle, rendered_size)` calls `page.get_selected_region(scale, Poppler.SelectionStyle.GLYPH, rectangle)`, enumerates the returned Cairo region, and converts its rectangles into rendered coordinates.
-- `selected_text(page, rectangle)` calls `page.get_selected_text(Poppler.SelectionStyle.GLYPH, rectangle)` and returns a safe string.
-
-The adapter should catch `GLib.Error`, unexpected `None`, and malformed region data. A failure clears or leaves the prior valid selection as appropriate, logs a diagnostic, and never crashes the reader.
-
-Do not use the deprecated `get_selection_region()` list API. Do not use the newer `render_transparent_selection()` API so the implementation continues to work with older Poppler releases that support `get_selected_region()`.
-
-## 5. Page Overlay and Gesture Integration
-
-Extend the current page stack without replacing its raster renderer:
+Build the navigation area as one stable container with two child presentations
+or a `Gtk.Stack`:
 
 ```text
-Gtk.Frame (.reader-page)
-└── Gtk.Fixed (exact rendered page size; owns page gestures)
-    ├── Gtk.Picture (PDF raster at 0, 0)
-    ├── Gtk.DrawingArea (non-targetable selection highlight at 0, 0)
-    └── annotation marker buttons (interactive and visually on top)
+bottom controls
+├── Previous
+├── state-dependent position
+│   ├── VIEW: [editable page] of [page count]
+│   └── ANNOTATE: Annotation [ordinal] of [count]
+├── Next
+├── zoom controls
+└── View / Annotate mode controls
 ```
 
-The drawing area should match the actual rendered width and height, use `set_can_target(False)`, and paint the current list of highlight rectangles in its draw callback.
+- The annotation position is display-only. Do not reuse the page-entry widget
+  as an editable annotation field.
+- Previous/Next labels may remain stable, but their tooltips and accessible
+  labels must describe pages in `VIEW` and annotations in `ANNOTATE`.
+- In `VIEW`, sensitivity continues to follow page boundaries.
+- In `ANNOTATE`, sensitivity follows annotation-sequence boundaries. Both are
+  disabled for `No annotations`; annotation placement itself remains enabled.
+- Switching states swaps the position presentation immediately, without
+  triggering a render when the page does not change.
+- Keep zoom controls available in either state. Mode controls are disabled when
+  no document is loaded.
 
-Add a `Gtk.GestureDrag` for primary-button selection and a secondary-button `Gtk.GestureClick` for the context menu. Keep the existing primary click gesture for annotation placement and selection clearing. Define explicit gesture arbitration:
+Centralize this in a state-aware control refresh rather than spreading mode
+conditionals across button callbacks. The callbacks should dispatch semantic
+commands (`previous`, `next`) whose meaning is resolved by the current state.
 
-- In annotation mode, annotation placement owns a valid primary click and text selection does not start.
-- Outside annotation mode, a drag starting inside a marker's tracked bounds is denied so the marker button receives the event.
-- Once movement passes the drag threshold, the selection drag claims the event sequence and annotation placement/click clearing cannot run.
-- A released click that was not claimed as a drag clears the selection.
-- Context-menu activation must not start or alter a drag selection.
+## 5. Annotation Navigation and Active Marker
 
-Do not infer marker hits only from event propagation. Continue using the existing marker-bound map as a defensive check because marker widgets and the fixed container both have controllers.
+Track the active item by annotation ID, never by list index. Derive its ordinal
+from a fresh ordered tuple whenever annotations change.
 
-## 6. Window State and Lifecycle
+When annotation traversal targets an item on another page:
 
-Add explicit selection state to `ReaderWindow`:
+1. Save/close an open annotation editor using the existing failure behavior.
+2. Change `_current_page`, persist the reading position, and queue the normal
+   page render.
+3. Keep the target annotation ID while rendering.
+4. After markers are rebuilt, give the target marker a distinct active style
+   and scroll it into view if needed.
 
-- Drag anchor and current widget coordinates while a gesture is active.
-- Current immutable PDF-space selection, or `None`.
-- Current selected text.
-- Current rendered highlight rectangles.
-- Whether the active pointer sequence crossed the drag threshold.
-- Pending throttled highlight update source ID, if live updates are coalesced.
-- Current selection context popover, if any.
+On the same page, update marker emphasis and controls without rerendering the
+PDF. Active styling must coexist with hover, focus, and the existing resting
+marker class, and cannot be the only indication of position; the bottom text
+and accessible description provide redundant feedback.
 
-Centralize cleanup in `_clear_text_selection()` so it resets state, closes the context menu, cancels any pending update, queues one highlight redraw, and refreshes copy-action sensitivity.
+Keyboard commands are state-dependent:
 
-Lifecycle rules:
+- `V` and `A` always request their named states when focus is not in a text
+  input and no Ctrl/Alt/Meta/Super modifier is held.
+- In `VIEW`, existing page-navigation keys retain their current behavior.
+- In `ANNOTATE`, Left/Page Up/Shift+Space and Right/Page Down/Space traverse
+  annotations; Home/End select the first/last annotation.
+- `Enter` on the focused/active annotation may continue through the marker's
+  normal activation path; annotation traversal itself does not open editors.
 
-- Opening a document, changing pages, entering an error state, or closing the window clears selection.
-- Entering annotation mode clears selection before changing the cursor to a crosshair.
-- Opening an annotation editor clears selection; saving failures still leave the editor and its text intact.
-- Zooming, fit-mode resize, and cached renders retain a selection only when the document and page are unchanged; `_apply_rendered_page()` recalculates its highlight geometry.
-- A render-generation mismatch must never apply stale highlight geometry to a newer page.
-- The page cursor is `crosshair` in annotation mode and `text` during normal selection mode; empty/loading/error states use the default cursor.
-- Disable PDF selection behavior while a text input owns focus.
+## 6. Placement, Editing, and Lifecycle Transitions
 
-## 7. Clipboard and Actions
+### Placement
 
-Add one window-level copy action or equivalent centralized handler and route `Ctrl+C` through it only when the PDF selection owns the command.
+- Page clicks place annotations only in `ANNOTATE`.
+- Marker clicks never place a new annotation.
+- On a successful create/save, set the new annotation as active long enough to
+  refresh the sequence, dispatch `ANNOTATION_PLACED`, enter `VIEW`, rebuild the
+  markers, and open the new annotation's editor.
+- On save failure, restore the store snapshot, show the existing feedback, and
+  stay in `ANNOTATE` with the prompt and crosshair intact.
 
-Clipboard behavior:
+### Editing and deletion
 
-- Preserve Poppler's returned Unicode text and line breaks.
-- Copy plain text via `Gdk.ContentProvider.new_for_value(...)` and `Gdk.Clipboard.set_content(...)` using the current display clipboard.
-- Keep the content provider alive for as long as GTK requires; store it on the window if the binding does not retain it reliably.
-- Treat clipboard rejection as a recoverable error and show feedback rather than clearing the selection.
-- Do not intercept `Ctrl+C` when focus is in the page-number entry or annotation note editor.
+- Opening an existing marker editor does not itself change state.
+- State transitions that close an editor must preserve its current retry-safe
+  behavior when saving fails.
+- After deletion, repair the active ID deterministically and refresh both the
+  counter and markers. If no annotations remain, show `No annotations` while
+  preserving the current mode.
 
-The context popover should be anchored near the pointer release/right-click point, remain inside the page/window, be keyboard navigable, and expose accessible labels for both actions.
+### Document and rendering lifecycle
 
-## 8. Accessibility and Input Details
+- Document open begins from `VIEW`; completing an asynchronous load must not
+  restore a stale mode or annotation ID from the previous document.
+- Page renders, zoom changes, fit resizes, dark-mode rerenders, and cache hits
+  preserve mode and active annotation.
+- Error, empty, and shutdown paths use a state-machine reset event before
+  clearing document-owned data.
+- Guard asynchronous render completion with the existing document/page/render
+  generations so an old render cannot highlight an annotation in the new
+  document or overwrite its controls.
 
-The raster page plus drawn overlay is not itself a full accessible text surface. Within the scope of this feature:
+## 7. Refactor Phases
 
-- Give the page container an accessible description explaining that text can be selected by dragging and copied with `Ctrl+C`.
-- Announce successful copy through the visible feedback label and, where GTK permits, an accessible status role/live update.
-- Ensure `Copy` and `Clear Selection` in the context menu are keyboard focusable.
-- Maintain visible high-contrast focus indication on annotation markers above the selection.
-- Do not communicate selection solely through cursor shape; the persistent highlight is the redundant visual state.
+### Phase 1 - Pure state and annotation-sequence model
 
-Full screen-reader traversal of PDF text requires a semantic text accessibility layer and is outside this iteration.
+- Add `ReaderMode`, transition events, and the pure transition function.
+- Add helpers for sorted annotation IDs, entry selection, ordinal/count display,
+  traversal, and deletion fallback.
+- Unit-test all transition pairs, idempotent `V`/`A`, empty sequences, numbering
+  gaps, current-page preference, wrapping on entry, and deleted active IDs.
 
-## 9. Performance and Failure Handling
+Deliverable: mode and annotation-position decisions are deterministic without
+constructing a GTK window.
 
-- Coalesce drag-motion highlight calculations to at most once per GTK frame/idle cycle. Always process the final release coordinates synchronously before extracting text.
-- Never rerender the PDF texture to update a selection; repaint only the lightweight drawing area.
-- Cache the current page object/source dimensions for the displayed render, scoped by document, page, and render generation.
-- Skip duplicate highlight work when the clamped endpoint has not changed.
-- Put a reasonable upper bound on the number of highlight rectangles accepted from Poppler; if exceeded, fall back to a single update on release rather than freezing the UI.
-- If Poppler reports no text or no region, clear the transient drag without showing an error.
-- If text extraction succeeds but region generation fails, keep the text copyable and show no misleading highlight only if the failure is logged; retry region generation after the next render.
-- If the PDF has an image-only page or a broken text map, selection simply produces no result. The UI must not imply that OCR is occurring.
-- Cancel pending drag/auto-scroll work on page change, document change, error, and shutdown.
+### Phase 2 - Migrate `ReaderWindow` to the state machine
 
-## 10. Implementation Phases
+- Replace `_annotation_mode` with `_reader_mode` and a single transition
+  gateway.
+- Route button, keyboard, placement, error, document, and close paths through
+  typed events.
+- Make cursor, prompt, text-selection eligibility, and placement gestures read
+  the new state.
+- Preserve editor-save failure semantics across attempted transitions.
 
-### Phase 1 - Pure selection model and Poppler adapter
+Deliverable: current view/annotation behavior operates from one source of
+truth, with `V` and `A` selecting states rather than toggling.
 
-- Add immutable selection/point/rectangle values and coordinate conversion helpers.
-- Add wrappers for `get_selected_region()` and `get_selected_text()`.
-- Add tests for forward/reverse drags, clamping, render/source scaling, invalid dimensions, Unicode, line breaks, empty text, and Poppler failures.
+### Phase 3 - State-dependent controls and annotation traversal
 
-Deliverable: a directional PDF selection can produce safe text and render-aligned highlight rectangles without GTK window state.
+- Add mutually exclusive View/Annotate controls.
+- Add the bottom `Gtk.Stack` (or equivalent) for page versus annotation
+  position.
+- Dispatch Previous/Next and navigation keys according to state.
+- Track active annotation IDs across page renders and annotation mutations.
+- Add active-marker styling, scrolling, tooltips, and accessible descriptions.
 
-### Phase 2 - Highlight overlay and pointer drag
+Deliverable: `VIEW` shows page position; `ANNOTATE` shows and navigates
+`Annotation N of M`.
 
-- Add the non-targetable `Gtk.DrawingArea` between the page picture and annotation markers.
-- Add primary drag handling, threshold behavior, live coalesced region updates, and final extraction.
-- Set the normal page cursor to an I-beam and draw a theme-aware translucent selection.
-- Add edge auto-scroll and ensure page-relative coordinates remain correct while scrolling.
+### Phase 4 - Placement transition and lifecycle hardening
 
-Deliverable: dragging across text visibly selects the intended content on the current page.
+- Return to `VIEW` only after successful annotation persistence.
+- Refresh/order annotations before opening the new note editor.
+- Repair active state after deletion and reset it across document/error/close
+  boundaries.
+- Verify text selection, zoom, rendering, fullscreen, and editor interactions
+  in both states.
 
-### Phase 3 - Copy, clear, and context menu
+Deliverable: all success, failure, and asynchronous paths preserve valid state
+and synchronized UI.
 
-- Add `Ctrl+C` clipboard support without stealing copy from existing text inputs.
-- Add the right-click `Copy`/`Clear Selection` popover.
-- Implement click and `Esc` clearing plus copy/error feedback.
-- Add accessible labels and focus behavior for selection actions.
+### Phase 5 - Documentation and verification
 
-Deliverable: selected PDF text can be copied as plain Unicode text and dismissed predictably.
+- Update `README.md` with `V`/`A`, state-specific bottom controls, annotation
+  traversal, placement return behavior, and `Esc` semantics.
+- Run all automated tests plus the manual matrix below.
+- Reinstall the local desktop copy if needed for realistic GTK verification,
+  without committing generated installation artifacts.
 
-### Phase 4 - Annotation and render lifecycle integration
+Deliverable: behavior is documented and regression-tested from both checkout
+and desktop launches.
 
-- Define gesture ownership with annotation placement and marker buttons.
-- Clear selection when opening an annotation editor or entering annotation mode.
-- Preserve and redraw selection through same-page zoom, fit resize, and render-cache hits.
-- Clear stale state on navigation, new documents, errors, and close.
+## 8. Automated Verification
 
-Deliverable: text selection coexists with every existing reader and annotation interaction.
+Add tests for:
 
-### Phase 5 - Documentation and full verification
+- Initial/default mode and every defined transition.
+- Idempotent `V` in `VIEW` and `A` in `ANNOTATE`.
+- Modified shortcuts and focused text inputs do not change mode.
+- State controls cannot become simultaneously active or desynchronize from the
+  state machine.
+- `Esc` priority with an editor, annotation mode, selection, and fullscreen.
+- Annotation ordering by display number when numbers have gaps.
+- Entry selection on the current page, later-page fallback, wrap, and the empty
+  sequence.
+- Previous/next and Home/End boundary behavior across pages.
+- Counter text such as `Annotation 5 of 15` uses ordinal/count, not display
+  number.
+- Same-page traversal avoids rendering; cross-page traversal queues the normal
+  generation-guarded render.
+- Successful placement transitions to `VIEW`; failed persistence remains in
+  `ANNOTATE` and restores annotation data.
+- Active-annotation repair after deleting first, middle, last, and only items.
+- Opening a new document and error/close paths clear stale annotation IDs and
+  return to `VIEW`.
+- Existing annotation storage, text selection, rendering, settings, and
+  navigation tests continue to pass.
 
-- Update `README.md` with drag-to-select, `Ctrl+C`, context menu behavior, and the no-OCR/single-page limits.
-- Run all automated tests and the manual matrix below.
-- Verify dependency checking still reflects the minimum Poppler API actually used.
-- Reinstall the local desktop copy if needed for realistic GTK testing, without committing generated installation artifacts.
+Keep transition and sequence logic pure so most new coverage remains
+display-server independent. Add narrow GTK integration tests only for control
+synchronization and command routing where practical.
 
-Deliverable: the feature is documented, regression-tested, and behaves consistently from a checkout and desktop launch.
+## 9. Manual Verification
 
-## 11. Automated Verification
+With a PDF containing annotations on multiple pages, including gaps caused by
+deletion, verify:
 
-Add unit and integration-focused tests for:
+- A fresh document starts in `VIEW` with page position shown at the bottom.
+- `A` enters `ANNOTATE`; `V` returns to `VIEW`; repeated presses do not toggle.
+- View/Annotate controls, prompt, cursor, and bottom presentation always agree.
+- Entering `ANNOTATE` selects the documented current-page/fallback annotation
+  and shows the correct ordinal/count despite display-number gaps.
+- Previous/Next and all state-dependent keyboard commands traverse annotations,
+  change pages when needed, emphasize the correct marker, and stop at bounds.
+- A document with no annotations shows `No annotations` and still permits
+  placement.
+- Clicking blank page space in `ANNOTATE` creates exactly one annotation,
+  returns to `VIEW`, restores page controls, and opens the new note editor.
+- A simulated annotation save failure leaves the app in `ANNOTATE` and allows a
+  retry without consuming a number or creating a marker.
+- Clicking/editing/deleting markers works in both states; deleting the active
+  marker selects the intended neighbor and updates the count.
+- Text selection works in `VIEW`, is cleared/disabled in `ANNOTATE`, and works
+  again after returning to `VIEW`.
+- Page navigation in `VIEW`, annotation navigation in `ANNOTATE`, zoom, fit,
+  dark mode, scrolling, fullscreen, and rerenders do not desynchronize state.
+- Opening another PDF, load errors, and closing reset mode-owned state without
+  stale markers, counters, prompts, or asynchronous render effects.
+- Screen-reader labels and keyboard focus communicate the active mode and
+  annotation position without relying on color alone.
 
-- Widget-to-PDF conversion at the center and every boundary.
-- Independent X/Y conversion when actual integer render dimensions differ slightly from the ideal scale.
-- Forward, backward, upward, and downward drags preserve start/end semantics.
-- Pointer positions outside the page clamp safely.
-- Zero-sized, negative, non-finite, and extreme dimensions are rejected.
-- Poppler region rectangles convert back to rendered coordinates correctly.
-- Empty/whitespace extraction does not create a completed selection.
-- Unicode, ligatures where Poppler exposes them, and multiline text are returned without application-side rewriting.
-- A generated multiline PDF fixture selects expected text and produces a non-empty region at multiple scales.
-- Region/extraction exceptions are contained.
-- Selection cleanup cancels pending updates and removes all derived highlight rectangles.
-- `Ctrl+C` dispatch chooses a focused GTK text input before the PDF selection.
-- Annotation marker hit detection prevents selection from claiming the sequence.
-- Existing annotation, renderer, settings, navigation, and dependency tests continue to pass.
+## 10. Definition of Done
 
-Keep geometry, dispatch decisions, and Poppler result normalization in small functions so most coverage remains display-server independent.
-
-## 12. Manual Verification
-
-Use PDFs containing single-column text, multiple columns, mixed font sizes, rotated text, Unicode, and at least one scanned/image-only page. Verify:
-
-- The pointer is an I-beam over a normal rendered page and a crosshair only in annotation mode.
-- Dragging left-to-right, right-to-left, top-to-bottom, and bottom-to-top selects the intended text.
-- Selection highlights only Poppler-selected glyph/line areas, not the entire drag box.
-- Live highlighting remains responsive during a long drag and while edge auto-scrolling.
-- `Ctrl+C` pastes the expected Unicode text and line breaks into another application.
-- Copy from the page-number entry and annotation note editor still copies their own text.
-- Right-click actions work with mouse and keyboard and appear near the selected area.
-- A simple click and `Esc` clear selection according to the documented priority order.
-- Zoom in/out, fit resize, scrolling, fullscreen, and render-cache hits keep the highlight aligned.
-- Page changes and opening another PDF clear selection; returning to the page does not restore it.
-- Starting annotation mode clears selection, marker clicks open their editors, and dragging from a marker does not create a PDF selection.
-- Selection drag does not accidentally place an annotation, and annotation placement does not begin text selection.
-- Multi-column and rotated text follow Poppler's reading/selection behavior without application crashes.
-- Image-only pages simply yield no selection and no misleading error.
-- Very large pages and long selections do not freeze page navigation or shutdown.
-- Light and dark themes keep text legible under the highlight.
-
-## 13. Definition of Done
-
-The feature is complete when:
-
-- A reader can drag across selectable PDF text and see an accurate persistent highlight.
-- `Ctrl+C` and the context menu copy Poppler's selected plain text to the desktop clipboard.
-- Forward and reverse, single-line and multi-line selections work on the current page.
-- Selection remains aligned through scrolling, zoom, fit resize, fullscreen, and cached rerenders.
-- Selection and annotation gestures coexist without accidental markers, selections, or lost annotation notes.
-- Navigation, document changes, errors, and `Esc` clear selection predictably.
-- Scanned/image-only pages fail quietly without suggesting OCR support.
-- Poppler and clipboard failures do not crash the reader or corrupt existing state.
-- Automated tests cover coordinate conversion, Poppler adaptation, cleanup, and interaction dispatch.
-- The README and manual verification matrix describe the final behavior.
-- The PDF is never modified and selection state is never persisted or uploaded.
+- The explicit two-state machine is the sole source of truth for reader mode.
+- `VIEW` is the default; unmodified `V` and `A` select their respective states.
+- Page position is shown in `VIEW`; annotation ordinal/count is shown in
+  `ANNOTATE`.
+- Annotation traversal is deterministic across pages, numbering gaps,
+  mutations, and rerenders.
+- A successfully placed annotation returns the reader to `VIEW`; failure keeps
+  the user safely in `ANNOTATE`.
+- Existing reading, text-selection, rendering, persistence, and annotation
+  editing behavior remains intact.
+- Controls, cursor, prompt, markers, keyboard routing, and accessibility state
+  cannot drift apart.
+- Automated tests and the manual verification matrix pass, and the README
+  describes the final behavior.
