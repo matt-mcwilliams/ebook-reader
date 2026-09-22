@@ -31,6 +31,17 @@ from .renderer import (
     fit_scale_for_viewport,
     render_page,
 )
+from .reader_state import (
+    ReaderEvent,
+    ReaderMode,
+    annotation_after_delete,
+    annotation_index,
+    annotation_position,
+    initial_annotation_id,
+    neighboring_annotation_id,
+    ordered_annotations,
+    transition_mode,
+)
 from .settings import SettingsStore
 from .text_selection import (
     HighlightRectangle,
@@ -115,7 +126,9 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._reset_scroll_on_render = True
         self._file_dialog: Gtk.FileDialog | None = None
         self._closing = False
-        self._annotation_mode = False
+        self._reader_mode = ReaderMode.VIEW
+        self._active_annotation_id: str | None = None
+        self._syncing_mode_controls = False
         self._page_width = 0
         self._page_height = 0
         self._annotation_marker_buttons: dict[str, Gtk.Button] = {}
@@ -216,6 +229,14 @@ class ReaderWindow(Gtk.ApplicationWindow):
             .annotation-marker-resting,
             .annotation-marker-resting:hover {
                 background: @error_color;
+            }
+            .annotation-marker-active {
+                background: @accent_bg_color;
+                color: @accent_fg_color;
+                border-color: @theme_fg_color;
+            }
+            .annotation-marker-active:hover {
+                background: shade(@accent_bg_color, 0.86);
             }
             .annotation-marker:focus {
                 outline: 3px solid @theme_fg_color;
@@ -404,6 +425,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._previous_button.set_tooltip_text("Previous page (Left or Page Up)")
         self._previous_button.connect("clicked", self._on_previous_clicked)
 
+        self._position_stack = Gtk.Stack()
+        self._position_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+
+        page_position = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self._page_entry = Gtk.Entry()
         self._page_entry.set_width_chars(5)
         self._page_entry.set_max_length(7)
@@ -414,6 +439,14 @@ class ReaderWindow(Gtk.ApplicationWindow):
 
         self._page_total_label = Gtk.Label(label="of 0")
         self._page_total_label.add_css_class("dim-label")
+        page_position.append(self._page_entry)
+        page_position.append(self._page_total_label)
+        self._position_stack.add_named(page_position, "pages")
+
+        self._annotation_position_label = Gtk.Label(label="No annotations")
+        self._annotation_position_label.add_css_class("dim-label")
+        self._set_accessible_label(self._annotation_position_label, "Annotation position")
+        self._position_stack.add_named(self._annotation_position_label, "annotations")
 
         self._next_button = Gtk.Button(label="Next")
         self._next_button.set_tooltip_text("Next page (Right, Page Down, or Space)")
@@ -442,22 +475,28 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._fit_button.set_tooltip_text("Fit the page to the window (Ctrl+0)")
         self._fit_button.connect("toggled", self._on_fit_toggled)
 
+        self._view_button = Gtk.ToggleButton(label="View")
+        self._set_accessible_label(self._view_button, "View (V)")
+        self._view_button.set_tooltip_text("View the PDF (V)")
+        self._view_button.connect("toggled", self._on_view_toggled)
+
         self._annotate_button = Gtk.ToggleButton(label="Annotate")
+        self._annotate_button.set_group(self._view_button)
         self._annotate_button.add_css_class("annotation-mode-button")
         self._set_accessible_label(self._annotate_button, "Annotate (A)")
-        self._annotate_button.set_tooltip_text("Place an annotation (A)")
+        self._annotate_button.set_tooltip_text("Review or place annotations (A)")
         self._annotate_button.connect("toggled", self._on_annotate_toggled)
 
         for child in (
             self._previous_button,
-            self._page_entry,
-            self._page_total_label,
+            self._position_stack,
             self._next_button,
             separator,
             self._zoom_out_button,
             self._zoom_label,
             self._zoom_in_button,
             self._fit_button,
+            self._view_button,
             self._annotate_button,
         ):
             controls.append(child)
@@ -497,7 +536,11 @@ class ReaderWindow(Gtk.ApplicationWindow):
             return
         cursor_name: str | None = None
         if self._document is not None and self._page_width > 0 and self._page_height > 0:
-            cursor_name = "crosshair" if self._annotation_mode else "text"
+            cursor_name = (
+                "crosshair"
+                if self._reader_mode is ReaderMode.ANNOTATE
+                else "text"
+            )
         try:
             self._page_fixed.set_cursor(
                 Gdk.Cursor.new_from_name(cursor_name, None) if cursor_name else None
@@ -525,7 +568,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
     ) -> None:
         if (
             self._document is None
-            or self._annotation_mode
+            or self._reader_mode is ReaderMode.ANNOTATE
             or self._focus_is_text_input()
             or self._page_width <= 0
             or self._page_height <= 0
@@ -771,7 +814,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         x: float,
         y: float,
     ) -> None:
-        if self._annotation_mode or self._point_hits_marker(x, y):
+        if self._reader_mode is ReaderMode.ANNOTATE or self._point_hits_marker(x, y):
             gesture.set_state(Gtk.EventSequenceState.DENIED)
             return
         if not self._selected_text or not self._point_in_selection(x, y):
@@ -865,35 +908,126 @@ class ReaderWindow(Gtk.ApplicationWindow):
     def _show_reader_feedback(self, message: str) -> None:
         self._show_annotation_feedback(message)
 
+    def _on_view_toggled(self, button: Gtk.ToggleButton) -> None:
+        if self._syncing_mode_controls or not button.get_active():
+            return
+        self._transition_reader(ReaderEvent.ENTER_VIEW)
+
     def _on_annotate_toggled(self, button: Gtk.ToggleButton) -> None:
-        self._set_annotation_mode(button.get_active())
+        if self._syncing_mode_controls or not button.get_active():
+            return
+        self._transition_reader(ReaderEvent.ENTER_ANNOTATE)
 
-    def _set_annotation_mode(self, active: bool) -> bool:
-        """Keep annotation mode's state, button, prompt, and cursor together."""
+    def _transition_reader(self, event: ReaderEvent) -> bool:
+        """Apply one mode transition and synchronize every dependent widget."""
 
-        if active and self._document is None:
-            active = False
-        if active and self._annotation_editor is not None:
-            if not self._close_annotation_editor(save=True):
-                active = False
-        if active:
+        if event is ReaderEvent.ENTER_ANNOTATE:
+            if self._document is None:
+                self._sync_mode_controls()
+                return False
+            if self._reader_mode is not ReaderMode.ANNOTATE:
+                if self._annotation_editor is not None and not self._close_annotation_editor(save=True):
+                    self._sync_mode_controls()
+                    return False
+                self._clear_text_selection()
+                self._active_annotation_id = initial_annotation_id(
+                    self._current_annotations(),
+                    self._current_page,
+                )
+        elif event is ReaderEvent.ENTER_VIEW:
+            if self._reader_mode is ReaderMode.ANNOTATE:
+                self._clear_text_selection()
+        elif event is ReaderEvent.DOCUMENT_CLEARED:
             self._clear_text_selection()
+            self._active_annotation_id = None
 
-        self._annotation_mode = active
-        if self._annotate_button.get_active() != active:
-            self._annotate_button.set_active(active)
-
-        if active:
-            self._update_annotation_prompt()
-            self._annotation_prompt.set_visible(True)
-            try:
-                self._page_fixed.set_cursor(Gdk.Cursor.new_from_name("crosshair", None))
-            except (TypeError, GLib.Error):  # pragma: no cover - GTK version dependent
-                self._page_fixed.set_cursor(None)
-        else:
-            self._annotation_prompt.set_visible(False)
+        self._reader_mode = transition_mode(self._reader_mode, event)
+        self._sync_mode_controls()
+        self._update_annotation_prompt()
+        self._annotation_prompt.set_visible(self._reader_mode is ReaderMode.ANNOTATE)
+        self._update_reader_controls()
+        self._refresh_annotation_markers()
         self._update_page_cursor()
-        return active
+        return True
+
+    def _sync_mode_controls(self) -> None:
+        if not hasattr(self, "_view_button"):
+            return
+        active_view = self._reader_mode is ReaderMode.VIEW
+        active_annotate = self._reader_mode is ReaderMode.ANNOTATE
+        self._syncing_mode_controls = True
+        try:
+            if self._view_button.get_active() != active_view:
+                self._view_button.set_active(active_view)
+            if self._annotate_button.get_active() != active_annotate:
+                self._annotate_button.set_active(active_annotate)
+        finally:
+            self._syncing_mode_controls = False
+
+    def _current_annotations(self) -> tuple[Annotation, ...]:
+        document = self._document
+        if document is None:
+            return ()
+        return ordered_annotations(self._annotations.get_document(document.identity).annotations)
+
+    def _update_annotation_position(self) -> None:
+        position = annotation_position(self._current_annotations(), self._active_annotation_id)
+        if position is None:
+            self._annotation_position_label.set_text("No annotations")
+            self._set_accessible_label(self._annotation_position_label, "No annotations")
+            return
+        ordinal, count = position
+        text = f"Annotation {ordinal} of {count}"
+        self._annotation_position_label.set_text(text)
+        self._set_accessible_label(self._annotation_position_label, text)
+
+    def _update_active_marker_style(self) -> None:
+        for annotation_id, marker in self._annotation_marker_buttons.items():
+            if annotation_id == self._active_annotation_id:
+                marker.add_css_class("annotation-marker-active")
+                marker.remove_css_class("annotation-marker-resting")
+            else:
+                marker.remove_css_class("annotation-marker-active")
+
+    def _select_annotation(self, annotation_id: str | None, *, render_page: bool = True) -> bool:
+        annotations = self._current_annotations()
+        if annotation_id is None or annotation_index(annotations, annotation_id) is None:
+            return False
+        target = next(item for item in annotations if item.id == annotation_id)
+        if self._annotation_editor is not None and not self._close_annotation_editor(save=True):
+            return False
+        self._clear_text_selection()
+        self._active_annotation_id = annotation_id
+        page_changed = target.page != self._current_page
+        if page_changed:
+            self._current_page = target.page
+            self._reset_scroll_on_render = True
+            self._persist_current_document()
+            self._update_reader_controls()
+            if render_page:
+                self._queue_render()
+        else:
+            self._update_active_marker_style()
+            self._update_reader_controls()
+            self._scroll_active_marker_into_view()
+        return True
+
+    def _navigate_annotations(self, step: int) -> bool:
+        annotations = self._current_annotations()
+        if not annotations:
+            self._active_annotation_id = None
+            self._update_reader_controls()
+            return False
+        target_id = neighboring_annotation_id(annotations, self._active_annotation_id, step)
+        if target_id is None:
+            return False
+        return self._select_annotation(target_id)
+
+    def _scroll_active_marker_into_view(self) -> None:
+        marker = self._annotation_marker_buttons.get(self._active_annotation_id or "")
+        if marker is None:
+            return
+        marker.grab_focus()
 
     def _update_annotation_prompt(self) -> None:
         if self._document is None:
@@ -912,7 +1046,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
     ) -> None:
         """Create an annotation only for a click inside the rendered page."""
 
-        if self._annotation_mode:
+        if self._reader_mode is ReaderMode.ANNOTATE:
             if self._document is None:
                 return
             if self._point_hits_marker(x, y):
@@ -956,7 +1090,8 @@ class ReaderWindow(Gtk.ApplicationWindow):
             self._report_annotation_save_error("The annotation could not be saved", error)
             return
 
-        self._set_annotation_mode(False)
+        self._active_annotation_id = annotation.id
+        self._transition_reader(ReaderEvent.ANNOTATION_PLACED)
         self._refresh_annotation_markers()
         self._open_annotation_editor(annotation)
 
@@ -986,6 +1121,8 @@ class ReaderWindow(Gtk.ApplicationWindow):
             )
             button = Gtk.Button(label=str(annotation.number))
             button.add_css_class("annotation-marker")
+            if annotation.id == self._active_annotation_id:
+                button.add_css_class("annotation-marker-active")
             button.set_size_request(width, height)
             button.set_focusable(True)
             self._update_marker_metadata(button, annotation)
@@ -1059,6 +1196,9 @@ class ReaderWindow(Gtk.ApplicationWindow):
             return
         annotation = self._annotations.get(document.identity, annotation_id)
         if annotation is not None:
+            self._active_annotation_id = annotation.id
+            self._update_active_marker_style()
+            self._update_reader_controls()
             self._open_annotation_editor(annotation)
 
     def _open_annotation_editor(self, annotation: Annotation) -> None:
@@ -1075,8 +1215,6 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 return
             if not self._close_annotation_editor(save=True):
                 return
-        self._set_annotation_mode(False)
-
         popover = Gtk.Popover()
         popover.set_autohide(True)
         popover.set_position(Gtk.PositionType.BOTTOM)
@@ -1260,6 +1398,10 @@ class ReaderWindow(Gtk.ApplicationWindow):
         annotation_id = self._annotation_editor_annotation_id
         if document is None or annotation_id is None:
             return
+        before = self._current_annotations()
+        deleted_index = annotation_index(before, annotation_id)
+        if deleted_index is None:
+            deleted_index = 0
         snapshot = self._annotations.get_document(document.identity)
         try:
             self._annotations.delete(document.identity, annotation_id)
@@ -1272,8 +1414,13 @@ class ReaderWindow(Gtk.ApplicationWindow):
 
         self._close_annotation_confirmation()
         self._destroy_annotation_editor()
+        self._active_annotation_id = annotation_after_delete(
+            self._current_annotations(),
+            deleted_index,
+        )
         self._refresh_annotation_markers()
         self._update_annotation_prompt()
+        self._update_reader_controls()
 
     def _close_annotation_confirmation(self) -> None:
         confirmation = self._annotation_confirmation
@@ -1418,7 +1565,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         if not self._close_annotation_editor(save=True):
             return
         self._clear_text_selection()
-        self._set_annotation_mode(False)
+        self._transition_reader(ReaderEvent.DOCUMENT_CLEARED)
 
         if isinstance(file, Gio.File):
             path = file.get_path()
@@ -1435,6 +1582,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._render_cache.clear()
         generation = self._load_generation
         self._document = None
+        self._active_annotation_id = None
         self._current_page = 0
         self._page_width = 0
         self._page_height = 0
@@ -1502,11 +1650,12 @@ class ReaderWindow(Gtk.ApplicationWindow):
         if not self._close_annotation_editor(save=True):
             # Keep the editor and its unsaved text available for retry rather
             # than replacing it with an error page that would lose the note.
-            self._set_annotation_mode(False)
+            self._transition_reader(ReaderEvent.DOCUMENT_CLEARED)
             self._show_annotation_feedback(message)
             return
-        self._set_annotation_mode(False)
+        self._transition_reader(ReaderEvent.DOCUMENT_CLEARED)
         self._document = None
+        self._active_annotation_id = None
         self._page_width = 0
         self._page_height = 0
         self._displayed_page = None
@@ -1527,10 +1676,16 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._show_state("error")
 
     def _on_previous_clicked(self, _button: Gtk.Button) -> None:
-        self._go_to_page(self._current_page - 1)
+        if self._reader_mode is ReaderMode.ANNOTATE:
+            self._navigate_annotations(-1)
+        else:
+            self._go_to_page(self._current_page - 1)
 
     def _on_next_clicked(self, _button: Gtk.Button) -> None:
-        self._go_to_page(self._current_page + 1)
+        if self._reader_mode is ReaderMode.ANNOTATE:
+            self._navigate_annotations(1)
+        else:
+            self._go_to_page(self._current_page + 1)
 
     def _on_dark_mode_toggled(self, button: Gtk.ToggleButton) -> None:
         """Toggle RGB inversion for the rendered PDF page."""
@@ -1849,14 +2004,35 @@ class ReaderWindow(Gtk.ApplicationWindow):
         has_document = document is not None
         page_count = document.page_count if document is not None else 0
 
-        self._previous_button.set_sensitive(has_document and self._current_page > 0)
-        self._next_button.set_sensitive(has_document and self._current_page + 1 < page_count)
-        self._page_entry.set_sensitive(has_document)
+        annotations = self._current_annotations()
+        active_index = annotation_index(annotations, self._active_annotation_id)
+        if self._reader_mode is ReaderMode.ANNOTATE:
+            self._position_stack.set_visible_child_name("annotations")
+            self._page_entry.set_sensitive(False)
+            self._previous_button.set_tooltip_text("Previous annotation (Left or Page Up)")
+            self._next_button.set_tooltip_text("Next annotation (Right, Page Down, or Space)")
+            self._set_accessible_label(self._previous_button, "Previous annotation")
+            self._set_accessible_label(self._next_button, "Next annotation")
+            self._previous_button.set_sensitive(active_index is not None and active_index > 0)
+            self._next_button.set_sensitive(
+                active_index is not None and active_index + 1 < len(annotations)
+            )
+            self._update_annotation_position()
+        else:
+            self._position_stack.set_visible_child_name("pages")
+            self._page_entry.set_sensitive(has_document)
+            self._previous_button.set_tooltip_text("Previous page (Left or Page Up)")
+            self._next_button.set_tooltip_text("Next page (Right, Page Down, or Space)")
+            self._set_accessible_label(self._previous_button, "Previous page")
+            self._set_accessible_label(self._next_button, "Next page")
+            self._previous_button.set_sensitive(has_document and self._current_page > 0)
+            self._next_button.set_sensitive(has_document and self._current_page + 1 < page_count)
         self._page_total_label.set_text(f"of {page_count}")
         self._zoom_out_button.set_sensitive(has_document)
         self._zoom_in_button.set_sensitive(has_document)
         self._fit_button.set_sensitive(has_document)
         self._annotate_button.set_sensitive(has_document)
+        self._view_button.set_sensitive(has_document)
 
         if has_document:
             self._page_entry.set_text(str(self._current_page + 1))
@@ -1870,8 +2046,8 @@ class ReaderWindow(Gtk.ApplicationWindow):
             if self._fit_button.get_active():
                 self._fit_button.set_active(False)
 
-        if self._annotation_mode:
-            self._update_annotation_prompt()
+        self._sync_mode_controls()
+        self._update_annotation_prompt()
 
     def _focus_is_text_input(self) -> bool:
         focus = self.get_focus()
@@ -1890,8 +2066,8 @@ class ReaderWindow(Gtk.ApplicationWindow):
             if self._annotation_editor is not None:
                 self._close_annotation_editor(save=True)
                 return True
-            if self._annotation_mode:
-                self._set_annotation_mode(False)
+            if self._reader_mode is ReaderMode.ANNOTATE:
+                self._transition_reader(ReaderEvent.ENTER_VIEW)
                 return True
             if self._selected_text:
                 self._clear_text_selection()
@@ -1935,28 +2111,48 @@ class ReaderWindow(Gtk.ApplicationWindow):
             | Gdk.ModifierType.META_MASK
             | Gdk.ModifierType.SUPER_MASK
         )
-        if (
-            keyval in (Gdk.KEY_a, Gdk.KEY_A)
-            and not state & shortcut_modifiers
-            and self._document is not None
-        ):
-            self._set_annotation_mode(not self._annotation_mode)
-            return True
-        if keyval == Gdk.KEY_space and state & Gdk.ModifierType.SHIFT_MASK:
-            self._go_to_page(self._current_page - 1)
-            return True
-        if keyval in (Gdk.KEY_Right, Gdk.KEY_Page_Down, Gdk.KEY_space):
-            self._go_to_page(self._current_page + 1)
-            return True
-        if keyval in (Gdk.KEY_Left, Gdk.KEY_Page_Up):
-            self._go_to_page(self._current_page - 1)
-            return True
-        if keyval == Gdk.KEY_Home:
-            self._go_to_page(0)
-            return True
-        if keyval == Gdk.KEY_End and self._document is not None:
-            self._go_to_page(self._document.page_count - 1)
-            return True
+        if not state & shortcut_modifiers and self._document is not None:
+            if keyval in (Gdk.KEY_v, Gdk.KEY_V):
+                self._transition_reader(ReaderEvent.ENTER_VIEW)
+                return True
+            if keyval in (Gdk.KEY_a, Gdk.KEY_A):
+                self._transition_reader(ReaderEvent.ENTER_ANNOTATE)
+                return True
+
+        if self._reader_mode is ReaderMode.ANNOTATE:
+            if keyval == Gdk.KEY_space and state & Gdk.ModifierType.SHIFT_MASK:
+                self._navigate_annotations(-1)
+                return True
+            if keyval in (Gdk.KEY_Right, Gdk.KEY_Page_Down, Gdk.KEY_space):
+                self._navigate_annotations(1)
+                return True
+            if keyval in (Gdk.KEY_Left, Gdk.KEY_Page_Up):
+                self._navigate_annotations(-1)
+                return True
+            if keyval == Gdk.KEY_Home:
+                annotations = self._current_annotations()
+                self._select_annotation(annotations[0].id if annotations else None)
+                return True
+            if keyval == Gdk.KEY_End:
+                annotations = self._current_annotations()
+                self._select_annotation(annotations[-1].id if annotations else None)
+                return True
+        else:
+            if keyval == Gdk.KEY_space and state & Gdk.ModifierType.SHIFT_MASK:
+                self._go_to_page(self._current_page - 1)
+                return True
+            if keyval in (Gdk.KEY_Right, Gdk.KEY_Page_Down, Gdk.KEY_space):
+                self._go_to_page(self._current_page + 1)
+                return True
+            if keyval in (Gdk.KEY_Left, Gdk.KEY_Page_Up):
+                self._go_to_page(self._current_page - 1)
+                return True
+            if keyval == Gdk.KEY_Home:
+                self._go_to_page(0)
+                return True
+            if keyval == Gdk.KEY_End and self._document is not None:
+                self._go_to_page(self._document.page_count - 1)
+                return True
         return False
 
     def _on_scroll(
@@ -2017,7 +2213,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 file=sys.stderr,
             )
             self._destroy_annotation_editor()
-        self._set_annotation_mode(False)
+        self._transition_reader(ReaderEvent.DOCUMENT_CLEARED)
         self._persist_current_document()
         if not self.is_fullscreen():
             self._settings.set_window_size(self.get_width(), self.get_height())
