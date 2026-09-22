@@ -1588,6 +1588,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._current_page = 0
         self._page_width = 0
         self._page_height = 0
+        self._update_page_cursor()
         self._refresh_annotation_markers()
         self._update_reader_controls()
         self._reset_scroll_on_render = True
