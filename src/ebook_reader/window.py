@@ -192,6 +192,8 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._install_input_controllers()
         self.connect("close-request", self._on_close_request)
         self._refresh_recent_books()
+        self._sync_mode_controls()
+        self._update_reader_controls()
         self._show_state("empty")
 
     def _install_css(self) -> None:
