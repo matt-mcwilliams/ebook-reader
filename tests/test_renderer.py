@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import unittest
 
+import cairo
+
 from ebook_reader.renderer import (
     MAX_RENDER_BYTES,
     RenderCache,
     RenderCacheKey,
     RenderedPage,
+    _invert_surface,
     _render_dimensions,
     clamp_manual_scale,
     fit_scale_for_viewport,
@@ -59,6 +62,36 @@ class RendererTests(unittest.TestCase):
         key = RenderCacheKey("book", 0, "manual", 1.0)
         self.assertFalse(cache.put(key, fake_page(2, 2)))
         self.assertEqual(len(cache), 0)
+
+    def test_inverted_cache_entries_are_separate_from_normal_entries(self) -> None:
+        cache = RenderCache(max_bytes=100)
+        normal_key = RenderCacheKey("book", 0, "manual", 1.0)
+        inverted_key = RenderCacheKey("book", 0, "manual", 1.0, invert_colors=True)
+        cache.put(normal_key, fake_page(2, 2))
+        cache.put(inverted_key, fake_page(2, 2))
+
+        cache.prune_around(
+            document_id="book",
+            page_index=0,
+            zoom_mode="manual",
+            scale=1.0,
+            invert_colors=True,
+        )
+
+        self.assertIsNone(cache.get(normal_key))
+        self.assertIsNotNone(cache.get(inverted_key))
+
+    def test_invert_surface_inverts_each_rgb_channel(self) -> None:
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+        context = cairo.Context(surface)
+        context.set_source_rgb(0.2, 0.4, 0.8)
+        context.paint()
+
+        _invert_surface(context)
+        surface.flush()
+
+        # Cairo stores FORMAT_ARGB32 as BGRA on the target Linux platform.
+        self.assertEqual(list(bytes(surface.get_data())[:4]), [51, 153, 204, 255])
 
 
 if __name__ == "__main__":

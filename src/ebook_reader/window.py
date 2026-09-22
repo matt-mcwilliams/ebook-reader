@@ -56,10 +56,14 @@ class _RenderRequest:
     cache_key: RenderCacheKey
 
 
-def _render_page_job(page: object, scale: float) -> RenderedPage:
+def _render_page_job(page: object, scale: float, invert_colors: bool) -> RenderedPage:
     """Render one page away from GTK's main loop."""
 
-    return render_page(page, scale=scale)  # type: ignore[arg-type]
+    return render_page(
+        page,
+        scale=scale,
+        invert_colors=invert_colors,
+    )  # type: ignore[arg-type]
 
 
 def _centered_box(*, spacing: int = 12) -> Gtk.Box:
@@ -106,6 +110,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._current_page = 0
         self._zoom_mode = "fit"
         self._manual_zoom = DEFAULT_SCALE
+        self._invert_pdf_colors = False
         self._last_render_scale = DEFAULT_SCALE
         self._reset_scroll_on_render = True
         self._file_dialog: Gtk.FileDialog | None = None
@@ -150,6 +155,13 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._header_open_button.set_tooltip_text("Open a PDF")
         self._header_open_button.connect("clicked", self._on_open_clicked)
         header.pack_start(self._header_open_button)
+
+        self._dark_mode_button = Gtk.ToggleButton()
+        self._dark_mode_button.set_child(Gtk.Image.new_from_icon_name("weather-clear-symbolic"))
+        self._set_accessible_label(self._dark_mode_button, "Dark mode")
+        self._dark_mode_button.set_tooltip_text("Invert PDF colors (dark mode)")
+        self._dark_mode_button.connect("toggled", self._on_dark_mode_toggled)
+        header.pack_end(self._dark_mode_button)
         self.set_titlebar(header)
 
         self._stack = Gtk.Stack()
@@ -1520,6 +1532,22 @@ class ReaderWindow(Gtk.ApplicationWindow):
     def _on_next_clicked(self, _button: Gtk.Button) -> None:
         self._go_to_page(self._current_page + 1)
 
+    def _on_dark_mode_toggled(self, button: Gtk.ToggleButton) -> None:
+        """Toggle RGB inversion for the rendered PDF page."""
+
+        invert_colors = button.get_active()
+        button.set_tooltip_text(
+            "Show original PDF colors"
+            if invert_colors
+            else "Invert PDF colors (dark mode)"
+        )
+        if invert_colors == self._invert_pdf_colors:
+            return
+
+        self._invert_pdf_colors = invert_colors
+        if self._document is not None:
+            self._queue_render()
+
     def _go_to_page(self, index: int) -> None:
         """Move to a clamped zero-based page index and request a render."""
 
@@ -1647,12 +1675,14 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 page_index=self._current_page,
                 zoom_mode=self._zoom_mode,
                 scale=round(scale, 6),
+                invert_colors=self._invert_pdf_colors,
             )
             self._render_cache.prune_around(
                 document_id=document.identity.key,
                 page_index=self._current_page,
                 zoom_mode=self._zoom_mode,
                 scale=cache_key.scale,
+                invert_colors=cache_key.invert_colors,
             )
             cached = self._render_cache.get(cache_key)
         except DocumentError as error:
@@ -1683,7 +1713,12 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._render_spinner.set_visible(True)
         self._render_spinner.start()
         try:
-            future = self._render_executor.submit(_render_page_job, page, scale)
+            future = self._render_executor.submit(
+                _render_page_job,
+                page,
+                scale,
+                self._invert_pdf_colors,
+            )
         except RuntimeError:
             self._render_spinner.stop()
             self._render_spinner.set_visible(False)

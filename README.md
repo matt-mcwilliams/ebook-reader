@@ -47,7 +47,8 @@ PYTHONPATH=src python -m ebook_reader --check-dependencies
 While reading, use `Previous`/`Next` or the page field to navigate. Keyboard
 shortcuts include `Left`/`Right`, `Page Up`/`Page Down`, `Space`, `Home`, and
 `End`; `Ctrl+0` fits the page, `Ctrl++`/`Ctrl+-` adjust zoom, `F11` toggles
-fullscreen, and `Ctrl+O` opens another PDF. Press `A` or use `Annotate` to
+fullscreen, and `Ctrl+O` opens another PDF. Use the sun button in the header
+to invert the PDF's colors for dark reading. Press `A` or use `Annotate` to
 place a numbered marker on the current page; the marker opens a local note
 editor. Press `Esc` to cancel placement. Hold `Ctrl` while using the mouse
 wheel to change zoom. A PDF can also be dropped onto the window.

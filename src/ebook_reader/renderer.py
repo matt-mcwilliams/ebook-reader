@@ -47,6 +47,7 @@ class RenderCacheKey:
     page_index: int
     zoom_mode: str
     scale: float
+    invert_colors: bool = False
 
 
 class RenderCache:
@@ -97,6 +98,7 @@ class RenderCache:
         page_index: int,
         zoom_mode: str,
         scale: float,
+        invert_colors: bool = False,
     ) -> None:
         """Keep only the current/adjacent pages at the active scale."""
 
@@ -104,6 +106,7 @@ class RenderCache:
             if (
                 key.document_id != document_id
                 or key.zoom_mode != zoom_mode
+                or key.invert_colors != invert_colors
                 or abs(key.page_index - page_index) > 1
                 or not math.isclose(key.scale, scale, rel_tol=0.0, abs_tol=1e-6)
             ):
@@ -182,8 +185,21 @@ def _render_dimensions(width: float, height: float, scale: float) -> tuple[int, 
     )
 
 
-def render_page(page: Poppler.Page, *, scale: float = DEFAULT_SCALE) -> RenderedPage:
-    """Render a Poppler page to a GTK texture with a white paper background."""
+def _invert_surface(context: cairo.Context) -> None:
+    """Invert the RGB channels of an opaque Cairo surface in place."""
+
+    context.set_operator(cairo.OPERATOR_DIFFERENCE)
+    context.set_source_rgb(1.0, 1.0, 1.0)
+    context.paint()
+
+
+def render_page(
+    page: Poppler.Page,
+    *,
+    scale: float = DEFAULT_SCALE,
+    invert_colors: bool = False,
+) -> RenderedPage:
+    """Render a Poppler page to a GTK texture, optionally with inverted colors."""
 
     source_width, source_height = page.get_size()
     width, height = _render_dimensions(source_width, source_height, scale)
@@ -194,6 +210,11 @@ def render_page(page: Poppler.Page, *, scale: float = DEFAULT_SCALE) -> Rendered
     context.paint()
     context.scale(width / source_width, height / source_height)
     page.render(context)
+    if invert_colors:
+        # The page was rendered over an opaque white background, so Cairo's
+        # DIFFERENCE operator with opaque white inverts every RGB channel
+        # while keeping the texture fully opaque.
+        _invert_surface(context)
     surface.flush()
 
     # Cairo's ARGB32 pixels are premultiplied BGRA on the little-endian Linux
