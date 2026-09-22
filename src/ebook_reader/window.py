@@ -233,12 +233,12 @@ class ReaderWindow(Gtk.ApplicationWindow):
                 background: @error_color;
             }
             .annotation-marker-active {
-                background: @accent_bg_color;
-                color: @accent_fg_color;
-                border-color: @theme_fg_color;
+                background: @error_color;
+                color: white;
+                border: 3px solid @theme_fg_color;
             }
             .annotation-marker-active:hover {
-                background: shade(@accent_bg_color, 0.86);
+                background: shade(@error_color, 0.82);
             }
             .annotation-marker:focus {
                 outline: 3px solid @theme_fg_color;
@@ -948,7 +948,7 @@ class ReaderWindow(Gtk.ApplicationWindow):
         self._update_annotation_prompt()
         self._annotation_prompt.set_visible(self._reader_mode is ReaderMode.ANNOTATE)
         self._update_reader_controls()
-        self._refresh_annotation_markers()
+        self._update_active_marker_style()
         self._update_page_cursor()
         return True
 
